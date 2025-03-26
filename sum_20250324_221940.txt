@@ -1,0 +1,3368 @@
+目錄：/www/wwwroot/xart003.heatgroups.top/wp-content/plugins/ai-content-generator-plugin
+檔名：ai-content-generator.php
+==================================================
+<?php
+/**
+ * Plugin Name: AI Content Generator
+ * Plugin URI:  https://example.com/ai-content-generator
+ * Description: A distributed AI content generation system with tasks, nodes, and robust webhook callbacks. Designed for multi-modal AI generation, advanced UI/UX, and production readiness.
+ * Version:     1.0.1a
+ * Author:      HarvardWang
+ * Author URI:  https://example.com
+ * Text Domain: ai-content-generator
+ * Domain Path: /languages
+ */
+
+if (!defined('ABSPATH')) {
+    exit;
+}
+
+// 定义插件常量
+define('AICG_PLUGIN_VERSION', '1.0');
+define('AICG_PLUGIN_DIR', plugin_dir_path(__FILE__));
+define('AICG_PLUGIN_URL', plugin_dir_url(__FILE__));
+define('AICG_PLUGIN_BASENAME', plugin_basename(__FILE__));
+
+// 注册激活钩子：建立数据表并设置 WP Cron 排程
+register_activation_hook(__FILE__, function () {
+    require_once AICG_PLUGIN_DIR . 'includes/class-task-manager.php';
+    require_once AICG_PLUGIN_DIR . 'includes/class-node-manager.php';
+    
+    \AICG\Includes\Task_Manager::instance()->create_tables();
+    \AICG\Includes\Node_Manager::instance()->create_tables();
+    
+    \AICG\Includes\Task_Manager::handle_scheduled_tasks();
+    \AICG\Includes\Node_Manager::instance()->cleanup_offline_nodes();
+    
+    // 设置 WP Cron 排程
+    if (!wp_next_scheduled('acg_check_tasks_event')) {
+        wp_schedule_event(time(), 'fifteen_minutes', 'acg_check_tasks_event');
+    }
+});
+
+// 注册停用钩子：清除 WP Cron 排程
+register_deactivation_hook(__FILE__, function () {
+    wp_clear_scheduled_hook('acg_check_tasks_event');
+});
+
+// 添加十五分钟间隔到 Cron
+add_filter('cron_schedules', function ($schedules) {
+    $schedules['fifteen_minutes'] = [
+        'interval' => 15 * 60,
+        'display'  => __('Every 15 Minutes', 'ai-content-generator')
+    ];
+    return $schedules;
+});
+
+// 处理定期事件
+add_action('acg_check_tasks_event', function () {
+    \AICG\Includes\Task_Manager::handle_scheduled_tasks();
+    \AICG\Includes\Node_Manager::instance()->cleanup_offline_nodes();
+});
+
+// 注册后台菜单
+add_action('admin_menu', function () {
+    // 主菜单：AI Content
+    add_menu_page(
+        __('AI Content', 'ai-content-generator'),
+        __('AI Content', 'ai-content-generator'),
+        'manage_options',
+        'aicg-main-menu',
+        function () {
+            include AICG_PLUGIN_DIR . 'templates/admin-main-page.php';
+        },
+        'dashicons-art',
+        26
+    );
+    
+    // 子菜单：Tasks
+    add_submenu_page(
+        'aicg-main-menu',
+        __('AI Tasks Management', 'ai-content-generator'),
+        __('Tasks', 'ai-content-generator'),
+        'manage_options',
+        'aicg-tasks-page',
+        function () {
+            include AICG_PLUGIN_DIR . 'templates/admin-tasks-page.php';
+        }
+    );
+    
+    // 子菜单：Nodes
+    add_submenu_page(
+        'aicg-main-menu',
+        __('AI Nodes Management', 'ai-content-generator'),
+        __('Nodes', 'ai-content-generator'),
+        'manage_options',
+        'aicg-nodes-page',
+        function () {
+            include AICG_PLUGIN_DIR . 'templates/admin-nodes-page.php';
+        }
+    );
+});
+
+// 注册 REST API 路由
+add_action('rest_api_init', function () {
+    require_once AICG_PLUGIN_DIR . 'includes/class-api-controller.php';
+    \AICG\Includes\Api_Controller::register_routes();
+});
+
+// 加载核心类
+require_once AICG_PLUGIN_DIR . 'includes/class-task-manager.php';
+require_once AICG_PLUGIN_DIR . 'includes/class-node-manager.php';
+require_once AICG_PLUGIN_DIR . 'includes/class-api-controller.php';
+require_once AICG_PLUGIN_DIR . 'includes/class-webhook-handler.php';
+
+目錄：/www/wwwroot/xart003.heatgroups.top/wp-content/plugins/ai-content-generator-plugin
+檔名：convert_text_to_files.php
+==================================================
+<?php
+/**
+ * convert_text_to_files.php
+ *
+ * 使用方式：
+ *   透過瀏覽器開啟，例如：
+ *     http://your-domain/convert_text_to_files.php?input_file=a.txt
+ *
+ * 此腳本會讀取指定的輸入檔案，解析出每個檔案的「目錄」、「檔名」與內容，
+ * 並在對應的目錄下寫入檔案（若目錄不存在，則會自動建立）。
+ * 
+ * 每個建立或覆蓋的檔案最前面都會加上覆蓋時間，且 echo 輸出也會附上時間碼。
+ */
+
+// 檢查是否有透過 GET 參數提供 input_file
+if (!isset($_GET['input_file'])) {
+    echo "[" . date("Y-m-d H:i:s") . "] 請提供輸入檔案，例如：convert_text_to_files.php?input_file=a.txt";
+    exit;
+}
+
+$inputFile = $_GET['input_file'];
+if (!file_exists($inputFile)) {
+    echo "[" . date("Y-m-d H:i:s") . "] 輸入檔案不存在：$inputFile";
+    exit;
+}
+
+// 讀取整個輸入檔案
+$content = file_get_contents($inputFile);
+
+// 使用正規表達式解析區塊
+// 每個區塊以 "目錄：" 開頭，接著 "檔名："，再以一行至少 10 個 '=' 作為分隔線，
+// 分隔線之後直到下一個 "目錄：" 或檔案結尾為檔案內容
+$pattern = '/目錄：(.*?)\s*檔名：(.*?)\s*={10,}\s*(.*?)(?=目錄：|$)/s';
+preg_match_all($pattern, $content, $matches, PREG_SET_ORDER);
+
+if (!$matches) {
+    echo "[" . date("Y-m-d H:i:s") . "] 未找到有效的檔案區塊。";
+    exit;
+}
+
+// 取得當前覆蓋時間（此時間會寫入每個檔案作為 header）
+$timestamp = date("Y-m-d H:i:s");
+$headerComment = "/* 覆蓋時間：$timestamp */\n";
+
+foreach ($matches as $match) {
+    // 解析目錄、檔名及檔案內容（保留原始格式）
+    $directory   = trim($match[1]);
+    $filename    = trim($match[2]);
+    $fileContent = $match[3];
+
+    // 檢查並建立目錄（允許遞迴建立）
+    if (!is_dir($directory)) {
+        if (!mkdir($directory, 0777, true)) {
+            echo "[" . date("Y-m-d H:i:s") . "] 無法建立目錄：$directory<br>";
+            continue;
+        }
+        echo "[" . date("Y-m-d H:i:s") . "] 已建立目錄：$directory<br>";
+    }
+
+    // 組合完整檔案路徑
+    $filepath = rtrim($directory, '/\\') . DIRECTORY_SEPARATOR . $filename;
+
+    // 根據檔案類型決定如何插入 header
+    $extension = strtolower(pathinfo($filename, PATHINFO_EXTENSION));
+    if ($extension === 'php' && strpos($fileContent, '<?php') === 0) {
+        // 若 PHP 檔案以 <?php 開頭，則在此標籤之後插入覆蓋時間註解
+        $fileContent = preg_replace('/^<\?php\s*/', "<?php\n" . $headerComment, $fileContent, 1);
+    } else {
+        // 其他檔案直接在最前面加上 header 註解
+        $fileContent = $headerComment . $fileContent;
+    }
+
+    // 寫入檔案（若已存在則覆蓋）
+    if (file_put_contents($filepath, $fileContent) === false) {
+        echo "[" . date("Y-m-d H:i:s") . "] 寫入檔案失敗：$filepath<br>";
+    } else {
+        echo "[" . date("Y-m-d H:i:s") . "] 檔案寫入成功：$filepath<br>";
+    }
+}
+?>
+
+
+目錄：/www/wwwroot/xart003.heatgroups.top/wp-content/plugins/ai-content-generator-plugin/templates
+檔名：admin-nodes-page.php
+==================================================
+<?php
+/**
+ * admin-nodes-page.php
+ *
+ * AI Nodes Management 管理后台页面
+ *  - 显示所有已注册的节点信息，包括节点 ID、节点类型、验证 Token、最后心跳时间及注册时间
+ *  - 提供关键字搜寻功能（针对节点类型与验证 Token）
+ *  - 支援分页导览
+ *  - 使用 Bootstrap 4 提供精緻、响应式的 UI/UX
+ *
+ * 仅供具有 manage_options 权限的管理员使用。
+ *
+ * @package AIContentGenerator
+ * @version 1.0
+ */
+
+if (!defined('ABSPATH')) {
+    exit;
+}
+
+use AICG\Includes\Node_Manager;
+
+// 确保当前使用者具有管理权限
+if (!current_user_can('manage_options')) {
+    wp_die(__('You do not have sufficient permissions to access this page.', 'ai-content-generator'));
+}
+
+global $wpdb;
+
+$node_manager = Node_Manager::instance();
+
+// 取得搜寻与分页参数
+$search_keyword = isset($_GET['search']) ? sanitize_text_field($_GET['search']) : '';
+$page           = isset($_GET['p']) ? intval($_GET['p']) : 1;
+$limit          = 20;
+$offset         = ($page - 1) * $limit;
+
+if (!empty($search_keyword)) {
+    // 使用 SQL 查询进行搜寻，对 node_type 与 auth_token 进行模糊搜寻
+    $like = '%' . $wpdb->esc_like($search_keyword) . '%';
+    $sql = $wpdb->prepare(
+        "SELECT * FROM {$wpdb->prefix}ai_nodes 
+         WHERE node_type LIKE %s OR auth_token LIKE %s
+         ORDER BY id DESC
+         LIMIT %d OFFSET %d",
+        $like,
+        $like,
+        $limit,
+        $offset
+    );
+    $nodes = $wpdb->get_results($sql);
+
+    // 取得搜寻结果总数
+    $count_sql = $wpdb->prepare(
+        "SELECT COUNT(*) FROM {$wpdb->prefix}ai_nodes 
+         WHERE node_type LIKE %s OR auth_token LIKE %s",
+        $like,
+        $like
+    );
+    $total_nodes = intval($wpdb->get_var($count_sql));
+} else {
+    // 无搜寻关键字时，直接取得所有节点（支援分页）
+    $nodes = $node_manager->get_all_nodes($limit, $offset);
+    $total_nodes = intval($wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->prefix}ai_nodes"));
+}
+
+$total_pages = ceil($total_nodes / $limit);
+?>
+<!DOCTYPE html>
+<html <?php language_attributes(); ?>>
+<head>
+    <meta charset="<?php bloginfo('charset'); ?>">
+    <title><?php _e('AI Nodes Management', 'ai-content-generator'); ?></title>
+    <!-- 载入 Bootstrap 4 -->
+    <link rel="stylesheet" href="https://maxcdn.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css">
+    <style>
+        .pagination { margin: 0; }
+        .table-responsive { margin-top: 20px; }
+        .action-buttons a { margin-right: 5px; }
+    </style>
+    <?php wp_head(); ?>
+</head>
+<body>
+<div class="container-fluid">
+    <h1 class="mt-3"><?php _e('AI Nodes Management', 'ai-content-generator'); ?></h1>
+
+    <!-- 搜寻表单 -->
+    <form class="form-inline my-3" method="get">
+        <input type="hidden" name="page" value="aicg-nodes-page">
+        <div class="form-group mr-3">
+            <label for="search" class="mr-2"><?php _e('Search:', 'ai-content-generator'); ?></label>
+            <input type="text" class="form-control" id="search" name="search" placeholder="<?php _e('Enter node type or token...', 'ai-content-generator'); ?>" value="<?php echo esc_attr($search_keyword); ?>">
+        </div>
+        <button type="submit" class="btn btn-primary"><?php _e('Search', 'ai-content-generator'); ?></button>
+    </form>
+
+    <!-- 节点列表 -->
+    <div class="table-responsive">
+        <table class="table table-bordered table-hover">
+            <thead class="thead-light">
+                <tr>
+                    <th><?php _e('Node ID', 'ai-content-generator'); ?></th>
+                    <th><?php _e('Node Type', 'ai-content-generator'); ?></th>
+                    <th><?php _e('Auth Token', 'ai-content-generator'); ?></th>
+                    <th><?php _e('Last Heartbeat', 'ai-content-generator'); ?></th>
+                    <th><?php _e('Registered At', 'ai-content-generator'); ?></th>
+                    <th><?php _e('Actions', 'ai-content-generator'); ?></th>
+                </tr>
+            </thead>
+            <tbody>
+                <?php if (!empty($nodes)): ?>
+                    <?php foreach ($nodes as $node): ?>
+                        <tr>
+                            <td><?php echo esc_html($node->id); ?></td>
+                            <td><?php echo esc_html($node->node_type); ?></td>
+                            <td><?php echo esc_html($node->auth_token); ?></td>
+                            <td>
+                                <?php
+                                // 判断节点是否离线（假设离线标准：最后心跳超过 10 分钟）
+                                $last_heartbeat = strtotime($node->last_heartbeat);
+                                $current_ts     = current_time('timestamp');
+                                if (($current_ts - $last_heartbeat) > 600) {
+                                    echo '<span class="text-danger">' . esc_html($node->last_heartbeat) . ' (Offline)</span>';
+                                } else {
+                                    echo esc_html($node->last_heartbeat) . ' (OK)';
+                                }
+                                ?>
+                            </td>
+                            <td><?php echo esc_html($node->registered_at); ?></td>
+                            <td class="action-buttons">
+                                <a href="<?php echo esc_url(admin_url('admin.php?page=aicg-node-edit&id=' . intval($node->id))); ?>" class="btn btn-sm btn-info"><?php _e('Edit', 'ai-content-generator'); ?></a>
+                                <a href="<?php echo esc_url(admin_url('admin.php?page=aicg-node-delete&id=' . intval($node->id))); ?>" class="btn btn-sm btn-danger" onclick="return confirm('<?php _e('Are you sure to delete this node?', 'ai-content-generator'); ?>');"><?php _e('Delete', 'ai-content-generator'); ?></a>
+                            </td>
+                        </tr>
+                    <?php endforeach; ?>
+                <?php else: ?>
+                    <tr>
+                        <td colspan="6" class="text-center"><?php _e('No nodes found.', 'ai-content-generator'); ?></td>
+                    </tr>
+                <?php endif; ?>
+            </tbody>
+        </table>
+    </div>
+
+    <!-- 分页导览 -->
+    <?php if ($total_pages > 1): ?>
+        <nav aria-label="Nodes Pagination">
+            <ul class="pagination justify-content-center">
+                <?php for ($i = 1; $i <= $total_pages; $i++): ?>
+                    <li class="page-item <?php echo ($i === $page) ? 'active' : ''; ?>">
+                        <a class="page-link" href="<?php echo esc_url(add_query_arg('p', $i)); ?>"><?php echo $i; ?></a>
+                    </li>
+                <?php endfor; ?>
+            </ul>
+        </nav>
+    <?php endif; ?>
+</div>
+
+<!-- 载入 Bootstrap 4 的 JavaScript -->
+<script src="https://code.jquery.com/jquery-3.5.1.slim.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/popper.js@1.16.1/dist/umd/popper.min.js"></script>
+<script src="https://maxcdn.bootstrapcdn.com/bootstrap/4.5.2/js/bootstrap.min.js"></script>
+<?php wp_footer(); ?>
+</body>
+</html>
+
+目錄：/www/wwwroot/xart003.heatgroups.top/wp-content/plugins/ai-content-generator-plugin/templates
+檔名：admin-main-page.php
+==================================================
+<?php
+/**
+ * admin-main-page.php
+ *
+ * AI Content Generator 主管理页面
+ *  - 提供系统概览、快速操作入口、关键统计信息
+ *  - 响应式设计，适配不同设备
+ *
+ * 仅供管理员（具有 manage_options 权限）使用。
+ *
+ * @package AIContentGenerator
+ * @version 1.0
+ */
+
+if (!defined('ABSPATH')) {
+    exit;
+}
+
+// 检查当前用户是否具有管理权限
+if (!current_user_can('manage_options')) {
+    wp_die(__('You do not have sufficient permissions to access this page.', 'ai-content-generator'));
+}
+
+// 获取全局数据库实例
+global $wpdb;
+
+// 获取任务和节点统计信息
+$task_manager = \AICG\Includes\Task_Manager::instance();
+$node_manager = \AICG\Includes\Node_Manager::instance();
+
+// 获取任务统计信息
+$total_tasks = $task_manager->count_tasks_by_status();
+$pending_tasks = isset($total_tasks['pending']) ? $total_tasks['pending'] : 0;
+$in_progress_tasks = isset($total_tasks['in_progress']) ? $total_tasks['in_progress'] : 0;
+$completed_tasks = isset($total_tasks['completed']) ? $total_tasks['completed'] : 0;
+$failed_tasks = isset($total_tasks['failed']) ? $total_tasks['failed'] : 0;
+
+// 获取节点统计信息
+$total_nodes = $node_manager->count_nodes();
+$online_nodes = $node_manager->count_online_nodes();
+$offline_nodes = $total_nodes - $online_nodes;
+?>
+<!DOCTYPE html>
+<html <?php language_attributes(); ?>>
+<head>
+    <meta charset="<?php bloginfo('charset'); ?>">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title><?php _e('AI Content Generator Dashboard', 'ai-content-generator'); ?></title>
+    <!-- 载入 Bootstrap 4 -->
+    <link rel="stylesheet" href="https://maxcdn.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css">
+    <style>
+        .dashboard-card {
+            border-radius: 8px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            margin-bottom: 20px;
+            transition: all 0.3s ease;
+        }
+        .dashboard-card:hover {
+            box-shadow: 0 5px 15px rgba(0,0,0,0.2);
+        }
+        .statistic-card {
+            text-align: center;
+            padding: 15px;
+            border-radius: 8px;
+            margin-bottom: 15px;
+        }
+        .statistic-card h3 {
+            margin: 0;
+            font-size: 24px;
+        }
+        .statistic-card p {
+            margin: 5px 0 0;
+            color: #666;
+        }
+    </style>
+    <?php wp_head(); ?>
+</head>
+<body class="wrap">
+    <h1><?php _e('AI Content Generator Dashboard', 'ai-content-generator'); ?></h1>
+    
+    <div class="row">
+        <div class="col-12">
+            <p class="description"><?php _e('Welcome to the AI Content Generator dashboard. From here you can manage all aspects of your distributed AI content generation system.', 'ai-content-generator'); ?></p>
+        </div>
+    </div>
+    
+    <div class="row">
+        <!-- 快速操作 -->
+        <div class="col-md-6 col-lg-4">
+            <div class="dashboard-card p-4">
+                <h3><?php _e('Quick Actions', 'ai-content-generator'); ?></h3>
+                <div class="list-group mt-3">
+                    <a href="<?php echo esc_url(admin_url('admin.php?page=aicg-tasks-page')); ?>" class="list-group-item list-group-item-action">
+                        <i class="dashicons dashicons-admin-post"></i> <?php _e('Manage Tasks', 'ai-content-generator'); ?>
+                    </a>
+                    <a href="<?php echo esc_url(admin_url('admin.php?page=aicg-nodes-page')); ?>" class="list-group-item list-group-item-action">
+                        <i class="dashicons dashicons-admin-users"></i> <?php _e('Manage Nodes', 'ai-content-generator'); ?>
+                    </a>
+                    <a href="#" class="list-group-item list-group-item-action" data-toggle="modal" data-target="#createTaskModal">
+                        <i class="dashicons dashicons-plus"></i> <?php _e('Create New Task', 'ai-content-generator'); ?>
+                    </a>
+                    <a href="#" class="list-group-item list-group-item-action" data-toggle="modal" data-target="#registerNodeModal">
+                        <i class="dashicons dashicons-plus"></i> <?php _e('Register New Node', 'ai-content-generator'); ?>
+                    </a>
+                </div>
+            </div>
+        </div>
+        
+        <!-- 系统统计 -->
+        <div class="col-md-6 col-lg-8">
+            <div class="dashboard-card">
+                <div class="card-header">
+                    <h3 class="card-title"><?php _e('System Statistics', 'ai-content-generator'); ?></h3>
+                </div>
+                <div class="card-body">
+                    <div class="row">
+                        <div class="col-md-6">
+                            <div class="statistic-card bg-light">
+                                <h3><?php echo esc_html($total_tasks); ?></h3>
+                                <p><?php _e('Total Tasks', 'ai-content-generator'); ?></p>
+                            </div>
+                            <div class="statistic-card bg-light">
+                                <h3><?php echo esc_html($pending_tasks); ?></h3>
+                                <p><?php _e('Pending Tasks', 'ai-content-generator'); ?></p>
+                            </div>
+                            <div class="statistic-card bg-light">
+                                <h3><?php echo esc_html($in_progress_tasks); ?></h3>
+                                <p><?php _e('In Progress', 'ai-content-generator'); ?></p>
+                            </div>
+                        </div>
+                        <div class="col-md-6">
+                            <div class="statistic-card bg-light">
+                                <h3><?php echo esc_html($completed_tasks); ?></h3>
+                                <p><?php _e('Completed Tasks', 'ai-content-generator'); ?></p>
+                            </div>
+                            <div class="statistic-card bg-light">
+                                <h3><?php echo esc_html($failed_tasks); ?></h3>
+                                <p><?php _e('Failed Tasks', 'ai-content-generator'); ?></p>
+                            </div>
+                            <div class="statistic-card bg-light">
+                                <h3><?php echo esc_html($total_nodes); ?></h3>
+                                <p><?php _e('Total Nodes', 'ai-content-generator'); ?></p>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <!-- 创建任务模态框 -->
+    <div class="modal fade" id="createTaskModal" tabindex="-1" role="dialog" aria-labelledby="createTaskModalLabel" aria-hidden="true">
+        <div class="modal-dialog" role="document">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title" id="createTaskModalLabel"><?php _e('Create New Task', 'ai-content-generator'); ?></h5>
+                    <button type="button" class="close" data-dismiss="modal" aria-label="Close">
+                        <span aria-hidden="true">&times;</span>
+                    </button>
+                </div>
+                <form id="createTaskForm" action="<?php echo esc_url(rest_url('api/v1/tasks/create')); ?>" method="post">
+                    <div class="modal-body">
+                        <div class="form-group">
+                            <label for="taskContentType"><?php _e('Content Type', 'ai-content-generator'); ?></label>
+                            <select class="form-control" id="taskContentType" name="content_type" required>
+                                <option value="text"><?php _e('Text', 'ai-content-generator'); ?></option>
+                                <option value="image"><?php _e('Image', 'ai-content-generator'); ?></option>
+                                <option value="music"><?php _e('Music', 'ai-content-generator'); ?></option>
+                                <option value="video"><?php _e('Video', 'ai-content-generator'); ?></option>
+                                <option value="printing"><?php _e('Printing', 'ai-content-generator'); ?></option>
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label for="taskPayload"><?php _e('Task Payload', 'ai-content-generator'); ?></label>
+                            <textarea class="form-control" id="taskPayload" name="content_payload" rows="3" required></textarea>
+                        </div>
+                        <div class="form-group">
+                            <label for="taskWebhook"><?php _e('Webhook URL', 'ai-content-generator'); ?></label>
+                            <input type="text" class="form-control" id="taskWebhook" name="webhook_url">
+                        </div>
+                    </div>
+                    <div class="modal-footer">
+                        <button type="button" class="btn btn-secondary" data-dismiss="modal"><?php _e('Close', 'ai-content-generator'); ?></button>
+                        <button type="submit" class="btn btn-primary"><?php _e('Create Task', 'ai-content-generator'); ?></button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+    
+    <!-- 注册节点模态框 -->
+    <div class="modal fade" id="registerNodeModal" tabindex="-1" role="dialog" aria-labelledby="registerNodeModalLabel" aria-hidden="true">
+        <div class="modal-dialog" role="document">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title" id="registerNodeModalLabel"><?php _e('Register New Node', 'ai-content-generator'); ?></h5>
+                    <button type="button" class="close" data-dismiss="modal" aria-label="Close">
+                        <span aria-hidden="true">&times;</span>
+                    </button>
+                </div>
+                <form id="registerNodeForm" action="<?php echo esc_url(rest_url('api/v1/nodes/register')); ?>" method="post">
+                    <div class="modal-body">
+                        <div class="form-group">
+                            <label for="nodeType"><?php _e('Node Type', 'ai-content-generator'); ?></label>
+                            <select class="form-control" id="nodeType" name="node_type" required>
+                                <option value="text_node"><?php _e('Text Generation Node', 'ai-content-generator'); ?></option>
+                                <option value="image_node"><?php _e('Image Generation Node', 'ai-content-generator'); ?></option>
+                                <option value="music_node"><?php _e('Music Generation Node', 'ai-content-generator'); ?></option>
+                                <option value="video_node"><?php _e('Video Generation Node', 'ai-content-generator'); ?></option>
+                                <option value="printing_node"><?php _e('Printing Node', 'ai-content-generator'); ?></option>
+                            </select>
+                        </div>
+                    </div>
+                    <div class="modal-footer">
+                        <button type="button" class="btn btn-secondary" data-dismiss="modal"><?php _e('Close', 'ai-content-generator'); ?></button>
+                        <button type="submit" class="btn btn-primary"><?php _e('Register Node', 'ai-content-generator'); ?></button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+    
+    <script src="https://code.jquery.com/jquery-3.5.1.slim.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/popper.js@1.16.1/dist/umd/popper.min.js"></script>
+    <script src="https://maxcdn.bootstrapcdn.com/bootstrap/4.5.2/js/bootstrap.min.js"></script>
+    <script>
+        // 处理创建任务表单提交
+        jQuery('#createTaskForm').submit(function(e) {
+            e.preventDefault();
+            const form = jQuery(this);
+            const button = form.find('button[type="submit"]');
+            const originalText = button.html();
+            
+            button.prop('disabled', true).html('<i class="spinner-border spinner-border-sm"></i> <?php _e('Processing', 'ai-content-generator'); ?>');
+            
+            jQuery.ajax({
+                url: form.attr('action'),
+                method: 'POST',
+                data: form.serialize(),
+                headers: {
+                    'X-WP-Nonce': '<?php echo wp_create_nonce('wp_rest'); ?>'
+                },
+                success: function(response) {
+                    alert('<?php _e('Task created successfully!', 'ai-content-generator'); ?>');
+                    form.trigger('reset');
+                },
+                error: function(xhr) {
+                    alert('<?php _e('Error creating task:', 'ai-content-generator'); ?> ' + xhr.responseText);
+                },
+                complete: function() {
+                    button.prop('disabled', false).html(originalText);
+                }
+            });
+        });
+        
+        // 处理注册节点表单提交
+        jQuery('#registerNodeForm').submit(function(e) {
+            e.preventDefault();
+            const form = jQuery(this);
+            const button = form.find('button[type="submit"]');
+            const originalText = button.html();
+            
+            button.prop('disabled', true).html('<i class="spinner-border spinner-border-sm"></i> <?php _e('Processing', 'ai-content-generator'); ?>');
+            
+            jQuery.ajax({
+                url: form.attr('action'),
+                method: 'POST',
+                data: form.serialize(),
+                headers: {
+                    'X-WP-Nonce': '<?php echo wp_create_nonce('wp_rest'); ?>'
+                },
+                success: function(response) {
+                    alert('<?php _e('Node registered successfully! Node ID: ', 'ai-content-generator'); ?> ' + response.node_id);
+                    form.trigger('reset');
+                },
+                error: function(xhr) {
+                    alert('<?php _e('Error registering node:', 'ai-content-generator'); ?> ' + xhr.responseText);
+                },
+                complete: function() {
+                    button.prop('disabled', false).html(originalText);
+                }
+            });
+        });
+    </script>
+    <?php wp_footer(); ?>
+</body>
+</html>
+
+目錄：/www/wwwroot/xart003.heatgroups.top/wp-content/plugins/ai-content-generator-plugin/templates
+檔名：admin-tasks-page.php
+==================================================
+<?php
+/**
+ * admin-tasks-page.php
+ *
+ * AI Tasks Management 管理后台页面
+ *  - 显示所有 AI 生成任务，支持状态筛选、关键字搜寻、分页
+ *  - 以 Bootstrap 提供精緻、响应式的 UI/UX 设计
+ *
+ * 仅供管理员（具有 manage_options 权限）使用。
+ *
+ * @package AIContentGenerator
+ * @version 1.0
+ */
+
+if (!defined('ABSPATH')) {
+    exit;
+}
+
+use AICG\Includes\Task_Manager;
+
+// 检查当前用户是否具有管理权限
+if (!current_user_can('manage_options')) {
+    wp_die(__('You do not have sufficient permissions to access this page.', 'ai-content-generator'));
+}
+
+global $wpdb;
+
+// 获取 Task_Manager 实例
+$task_manager = Task_Manager::instance();
+
+// 获取筛选参数：状态、搜寻关键字与目前页码
+$status_filter  = isset($_GET['status']) ? sanitize_text_field($_GET['status']) : '';
+$search_keyword = isset($_GET['search']) ? sanitize_text_field($_GET['search']) : '';
+$page           = isset($_GET['p']) ? intval($_GET['p']) : 1;
+$limit          = 20;
+$offset         = ($page - 1) * $limit;
+
+// 若有搜寻关键字，使用 search_tasks()，否则依状态或全部取得任务
+if (!empty($search_keyword)) {
+    $tasks       = $task_manager->search_tasks($search_keyword, $limit, $offset);
+    // 取得搜寻结果总数（此处简单示範，实际环境中可进一步优化）
+    $all_search  = $task_manager->search_tasks($search_keyword, 1000, 0);
+    $total_tasks = count($all_search);
+} else {
+    $tasks = $task_manager->get_all_tasks($status_filter, $limit, $offset);
+    if ($status_filter) {
+        $total_tasks = $task_manager->count_tasks_by_status($status_filter);
+    } else {
+        $total_tasks = $wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->prefix}ai_tasks");
+    }
+}
+$total_pages = ceil($total_tasks / $limit);
+?>
+<!DOCTYPE html>
+<html <?php language_attributes(); ?>>
+<head>
+    <meta charset="<?php bloginfo('charset'); ?>">
+    <title><?php _e('AI Tasks Management', 'ai-content-generator'); ?></title>
+    <!-- 载入 Bootstrap 4 -->
+    <link rel="stylesheet" href="https://maxcdn.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css">
+    <style>
+        /* 自定义样式 */
+        .pagination { margin: 0; }
+        .table-responsive { margin-top: 20px; }
+        .action-buttons a { margin-right: 5px; }
+    </style>
+    <?php wp_head(); ?>
+</head>
+<body>
+<div class="container-fluid">
+    <h1 class="mt-3"><?php _e('AI Tasks Management', 'ai-content-generator'); ?></h1>
+
+    <!-- 筛选与搜寻表单 -->
+    <form class="form-inline my-3" method="get">
+        <input type="hidden" name="page" value="aicg-tasks-page">
+        <div class="form-group mr-3">
+            <label for="status" class="mr-2"><?php _e('Status:', 'ai-content-generator'); ?></label>
+            <select class="form-control" id="status" name="status">
+                <option value=""><?php _e('All', 'ai-content-generator'); ?></option>
+                <option value="pending" <?php selected($status_filter, 'pending'); ?>><?php _e('Pending', 'ai-content-generator'); ?></option>
+                <option value="in_progress" <?php selected($status_filter, 'in_progress'); ?>><?php _e('In Progress', 'ai-content-generator'); ?></option>
+                <option value="completed" <?php selected($status_filter, 'completed'); ?>><?php _e('Completed', 'ai-content-generator'); ?></option>
+                <option value="failed" <?php selected($status_filter, 'failed'); ?>><?php _e('Failed', 'ai-content-generator'); ?></option>
+            </select>
+        </div>
+        <div class="form-group mr-3">
+            <label for="search" class="mr-2"><?php _e('Search:', 'ai-content-generator'); ?></label>
+            <input type="text" class="form-control" id="search" name="search" placeholder="<?php _e('Enter keyword...', 'ai-content-generator'); ?>" value="<?php echo esc_attr($search_keyword); ?>">
+        </div>
+        <button type="submit" class="btn btn-primary"><?php _e('Filter', 'ai-content-generator'); ?></button>
+    </form>
+
+    <!-- 任务列表 -->
+    <div class="table-responsive">
+        <table class="table table-bordered table-hover">
+            <thead class="thead-light">
+                <tr>
+                    <th><?php _e('ID', 'ai-content-generator'); ?></th>
+                    <th><?php _e('Content Type', 'ai-content-generator'); ?></th>
+                    <th><?php _e('Status', 'ai-content-generator'); ?></th>
+                    <th><?php _e('Retry Count', 'ai-content-generator'); ?></th>
+                    <th><?php _e('Result URL', 'ai-content-generator'); ?></th>
+                    <th><?php _e('Created At', 'ai-content-generator'); ?></th>
+                    <th><?php _e('Updated At', 'ai-content-generator'); ?></th>
+                    <th><?php _e('Actions', 'ai-content-generator'); ?></th>
+                </tr>
+            </thead>
+            <tbody>
+                <?php if (!empty($tasks)): ?>
+                    <?php foreach ($tasks as $task): ?>
+                        <tr>
+                            <td><?php echo esc_html($task->id); ?></td>
+                            <td><?php echo esc_html($task->content_type); ?></td>
+                            <td><?php echo esc_html($task->status); ?></td>
+                            <td><?php echo esc_html($task->retry_count); ?></td>
+                            <td>
+                                <?php if ($task->result_url): ?>
+                                    <a href="<?php echo esc_url($task->result_url); ?>" target="_blank"><?php _e('View', 'ai-content-generator'); ?></a>
+                                <?php else: ?>
+                                    -
+                                <?php endif; ?>
+                            </td>
+                            <td><?php echo esc_html($task->created_at); ?></td>
+                            <td><?php echo esc_html($task->updated_at); ?></td>
+                            <td class="action-buttons">
+                                <a href="<?php echo esc_url(admin_url('admin.php?page=aicg-task-edit&id=' . intval($task->id))); ?>" class="btn btn-sm btn-info"><?php _e('Edit', 'ai-content-generator'); ?></a>
+                                <a href="<?php echo esc_url(admin_url('admin.php?page=aicg-task-delete&id=' . intval($task->id))); ?>" class="btn btn-sm btn-danger" onclick="return confirm('<?php _e('Are you sure to delete this task?', 'ai-content-generator'); ?>');"><?php _e('Delete', 'ai-content-generator'); ?></a>
+                            </td>
+                        </tr>
+                    <?php endforeach; ?>
+                <?php else: ?>
+                    <tr>
+                        <td colspan="8" class="text-center"><?php _e('No tasks found.', 'ai-content-generator'); ?></td>
+                    </tr>
+                <?php endif; ?>
+            </tbody>
+        </table>
+    </div>
+
+    <!-- 分页导航 -->
+    <?php if ($total_pages > 1): ?>
+    <nav aria-label="Task pagination">
+        <ul class="pagination justify-content-center">
+            <?php for ($i = 1; $i <= $total_pages; $i++): ?>
+                <li class="page-item <?php echo ($i === $page) ? 'active' : ''; ?>">
+                    <a class="page-link" href="<?php echo esc_url(add_query_arg('p', $i)); ?>"><?php echo $i; ?></a>
+                </li>
+            <?php endfor; ?>
+        </ul>
+    </nav>
+    <?php endif; ?>
+</div>
+
+<!-- 载入 Bootstrap 4 JavaScript -->
+<script src="https://code.jquery.com/jquery-3.5.1.slim.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/popper.js@1.16.1/dist/umd/popper.min.js"></script>
+<script src="https://maxcdn.bootstrapcdn.com/bootstrap/4.5.2/js/bootstrap.min.js"></script>
+<?php wp_footer(); ?>
+</body>
+</html>
+
+目錄：/www/wwwroot/xart003.heatgroups.top/wp-content/plugins/ai-content-generator-plugin/python
+檔名：node_credentials.json
+==================================================
+{"node_id": 1, "auth_token": "naGFCXAfJuOPNcN9WawmQZzjM2Ftuw8i"}
+
+目錄：/www/wwwroot/xart003.heatgroups.top/wp-content/plugins/ai-content-generator-plugin/python
+檔名：ai_task2.py
+==================================================
+import os
+import json
+import time
+import requests
+import logging
+from datetime import datetime
+from hashlib import sha256
+from typing import Dict, Any, Optional
+
+# 配置日志记录
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+class NodeAgent:
+    def __init__(self, config_path: str = 'config.json'):
+        """
+        初始化节点代理，加载配置文件，设置节点属性。
+        
+        :param config_path: 配置文件路径，默认为 config.json
+        """
+        self.config = self._load_config(config_path)
+        self.node_id = None
+        self.auth_token = None
+        self.last_heartbeat = None
+        self._setup_node()
+
+    def _load_config(self, config_path: str) -> Dict[str, Any]:
+        """
+        加载配置文件。
+        
+        :param config_path: 配置文件路径
+        :return: 配置字典
+        """
+        if not os.path.exists(config_path):
+            raise FileNotFoundError(f"配置文件 {config_path} 不存在")
+        
+        with open(config_path, 'r') as f:
+            return json.load(f)
+
+    def _setup_node(self):
+        """
+        设置节点属性，从配置文件中获取节点类型等信息。
+        """
+        self.node_type = self.config.get('node_type', 'image_node')
+        self.wp_url = self.config.get('wordpress_url', 'https://xart003.heatgroups.top')
+        self.api_prefix = self.config.get('api_prefix', '/wp-json/api/v1')
+        
+        # 如果有保存的节点信息，加载它
+        if os.path.exists('node_credentials.json'):
+            with open('node_credentials.json', 'r') as f:
+                credentials = json.load(f)
+                self.node_id = credentials.get('node_id')
+                self.auth_token = credentials.get('auth_token')
+
+    def register_node(self):
+        """
+        注册节点到 WordPress 系统，获取节点 ID 和认证 Token。
+        """
+        if self.node_id and self.auth_token:
+            logger.info("节点已注册，无需重复注册")
+            return
+        
+        url = f"{self.wp_url}{self.api_prefix}/nodes/register"
+        data = {
+            'node_type': self.node_type
+        }
+        
+        try:
+            response = requests.post(url, json=data)
+            response.raise_for_status()
+            result = response.json()
+            
+            self.node_id = result['node_id']
+            self.auth_token = result['auth_token']
+            
+            # 保存节点信息到文件
+            with open('node_credentials.json', 'w') as f:
+                json.dump({'node_id': self.node_id, 'auth_token': self.auth_token}, f)
+                
+            logger.info(f"节点注册成功，Node ID: {self.node_id}")
+        except requests.exceptions.RequestException as e:
+            logger.error(f"节点注册失败: {e}")
+            raise
+
+    def pull_task(self) -> Optional[Dict[str, Any]]:
+        """
+        从 WordPress 系统拉取任务。
+        
+        :return: 任务信息字典，如果无任务则返回 None
+        """
+        if not self.auth_token:
+            logger.error("未获取到认证 Token，无法拉取任务")
+            return None
+        
+        url = f"{self.wp_url}{self.api_prefix}/tasks/pull"
+        headers = {
+            'Authorization': f'Bearer {self.auth_token}'
+        }
+        
+        try:
+            response = requests.post(url, headers=headers)
+            response.raise_for_status()
+            
+            task = response.json()
+            if task:
+                logger.info(f"拉取到任务，Task ID: {task['task_id']}")
+                return task
+            else:
+                logger.debug("当前无待处理任务")
+                return None
+        except requests.exceptions.RequestException as e:
+            logger.error(f"拉取任务失败: {e}")
+            return None
+
+    def generate_content(self, task: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        根据任务类型生成内容。
+        
+        :param task: 任务信息字典
+        :return: 生成结果字典
+        """
+        content_type = task.get('content_type')
+        payload = task.get('content_payload')
+        
+        # 根据内容类型调用不同的生成逻辑
+        if content_type == 'image':
+            return self._generate_image(payload)
+        else:
+            logger.error(f"不支持的内容类型: {content_type}")
+            return {'status': 'failed', 'error': f'不支持的内容类型: {content_type}'}
+
+    def _generate_image(self, prompt: str) -> Dict[str, Any]:
+        """
+        图像生成逻辑（模拟）。        
+        :param prompt: 图像生成提示
+        :return: 生成结果字典
+        """
+        logger.info(f"开始生成图像，提示: {prompt}")
+        # 这里返回模拟的图像 URL（实际中可集成如 Stable Diffusion API）
+        return {
+            'status': 'completed',
+            'result_url': 'https://example.com/images/generated_image.jpg',
+            'digital_id': self._generate_digital_id()
+        }
+
+    def _generate_digital_id(self) -> str:
+        """
+        生成数字身份证，使用 SHA-256 哈希结合节点 ID 和时间戳。
+        
+        :return: 数字身份证字符串
+        """
+        timestamp = str(int(time.time()))
+        data = f"{self.node_id}{timestamp}".encode('utf-8')
+        return sha256(data).hexdigest()
+
+    def report_task_result(self, task_id: int, result: Dict[str, Any]):
+        """
+        向 WordPress 系统报告任务结果。
+        
+        :param task_id: 任务 ID
+        :param result: 任务结果字典
+        """
+        if not self.auth_token:
+            logger.error("未获取到认证 Token，无法报告任务结果")
+            return
+        
+        url = f"{self.wp_url}{self.api_prefix}/tasks/complete"
+        headers = {
+            'Authorization': f'Bearer {self.auth_token}',
+            'Content-Type': 'application/json'
+        }
+        
+        payload = {
+            'task_id': task_id,
+            'status': result['status'],
+            'result_url': result.get('result_url'),
+            'error_message': result.get('error', '')
+        }
+        
+        try:
+            response = requests.post(url, headers=headers, json=payload)
+            response.raise_for_status()
+            logger.info(f"任务结果报告成功，Task ID: {task_id}")
+        except requests.exceptions.RequestException as e:
+            logger.error(f"任务结果报告失败: {e}")
+
+    def heartbeat(self):
+        """
+        向 WordPress 系统发送心跳，更新节点状态。
+        """
+        if not self.auth_token:
+            logger.error("未获取到认证 Token，无法发送心跳")
+            return
+        
+        url = f"{self.wp_url}{self.api_prefix}/nodes/last_heartbeat"  # Corrected URL to /nodes/heartbeat
+        headers = {
+            'Authorization': f'Bearer {self.auth_token}'
+        }
+        
+        try:
+            response = requests.post(url, headers=headers)
+            response.raise_for_status()
+            logger.info("心跳发送成功")
+        except requests.exceptions.RequestException as e:
+            logger.error(f"心跳发送失败: {e}")
+
+    def run(self):
+        """
+        运行节点代理，持续拉取任务并处理。
+        """
+        self.register_node()
+        
+        while True:
+            try:
+                task = self.pull_task()
+                if task:
+                    result = self.generate_content(task)
+                    self.report_task_result(task['task_id'], result)
+                
+                # 定期发送心跳
+                self.heartbeat()
+                
+                # 等待一段时间后继续拉取任务
+                time.sleep(20)
+            except Exception as e:
+                logger.error(f"节点运行时发生错误: {e}")
+                time.sleep(20)
+
+if __name__ == "__main__":
+    agent = NodeAgent()
+    agent.run()
+
+
+目錄：/www/wwwroot/xart003.heatgroups.top/wp-content/plugins/ai-content-generator-plugin/python
+檔名：config.json
+==================================================
+{
+  "node_type": "image_node",
+  "wordpress_url": "https://xart003.heatgroups.top",
+  "api_prefix": "/wp-json/api/v1"
+}
+
+
+目錄：/www/wwwroot/xart003.heatgroups.top/wp-content/plugins/ai-content-generator-plugin
+檔名：restore.php
+==================================================
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>檔案還原工具</title>
+</head>
+<body>
+    <h1>檔案還原工具</h1>
+
+    <?php
+    // WordPress 安裝目錄
+    $wpContentDir = $_SERVER['DOCUMENT_ROOT'] . '/wp-content';
+
+    // 設定 plugin 目錄為 WordPress 的 plugins 目錄
+    $pluginDir = $wpContentDir . '/plugins';
+
+    // 檢查是否有上傳檔案
+    if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['file'])) {
+        // 設定上傳的檔案存放路徑
+        $uploadDir = $pluginDir . '/uploads/';  // plugin 目錄下的 uploads 子目錄
+        // 確保上傳目錄存在
+        if (!is_dir($uploadDir)) {
+            mkdir($uploadDir, 0777, true);
+        }
+
+        $uploadFile = $uploadDir . basename($_FILES['file']['name']);
+        if (move_uploaded_file($_FILES['file']['tmp_name'], $uploadFile)) {
+            echo "<p>檔案上傳成功：{$uploadFile}</p>";
+
+            // 開始處理上傳的檔案
+            $inputFile = $uploadFile;
+
+            // 讀取上傳的檔案內容
+            $content = file_get_contents($inputFile);
+
+            // 使用正規表達式解析區塊
+            $pattern = '/目錄：(.*?)\s*檔名：(.*?)\s*={10,}\s*(.*?)(?=目錄：|$)/s';
+            preg_match_all($pattern, $content, $matches, PREG_SET_ORDER);
+
+            if (!$matches) {
+                echo "<p>未找到有效的檔案區塊。</p>";
+                exit;
+            }
+
+            // 取得當前覆蓋時間
+            $timestamp = date("Y-m-d H:i:s");
+            $headerComment = "/* 覆蓋時間：$timestamp */\n";
+
+            foreach ($matches as $match) {
+                // 解析目錄、檔名及檔案內容
+                $directory = trim($match[1]);
+                $filename = trim($match[2]);
+                $fileContent = $match[3];
+
+                // 檢查並建立目錄（在 plugin 目錄下）
+                $fullDirectory = $pluginDir . DIRECTORY_SEPARATOR . $directory;
+                if (!is_dir($fullDirectory)) {
+                    if (!mkdir($fullDirectory, 0777, true)) {
+                        echo "<p>無法建立目錄：$fullDirectory</p>";
+                        continue;
+                    }
+                    echo "<p>已建立目錄：$fullDirectory</p>";
+                }
+
+                // 組合完整檔案路徑
+                $filepath = rtrim($fullDirectory, '/\\') . DIRECTORY_SEPARATOR . $filename;
+
+                // 根據檔案類型決定如何插入 header
+                $extension = strtolower(pathinfo($filename, PATHINFO_EXTENSION));
+                if ($extension === 'php' && strpos($fileContent, '<?php') === 0) {
+                    // 若 PHP 檔案以 <?php 開頭，則在此標籤之後插入覆蓋時間註解
+                    $fileContent = preg_replace('/^<\?php\s*/', "<?php\n" . $headerComment, $fileContent, 1);
+                } else {
+                    // 其他檔案直接在最前面加上 header 註解
+                    $fileContent = $headerComment . $fileContent;
+                }
+
+                // 寫入檔案（若已存在則覆蓋）
+                if (file_put_contents($filepath, $fileContent) === false) {
+                    echo "<p>寫入檔案失敗：$filepath</p>";
+                } else {
+                    echo "<p>檔案寫入成功：$filepath</p>";
+                }
+            }
+        } else {
+            echo "<p>檔案上傳失敗。</p>";
+        }
+    }
+    ?>
+
+    <form action="convert_text_to_files.php" method="post" enctype="multipart/form-data">
+        <label for="file">選擇檔案 (sum_ 開頭的檔案可選擇):</label>
+        <input type="file" name="file" id="file" required>
+        <button type="submit">上傳並還原檔案</button>
+    </form>
+</body>
+</html>
+
+
+目錄：/www/wwwroot/xart003.heatgroups.top/wp-content/plugins/ai-content-generator-plugin/includes
+檔名：class-api-controller.php
+==================================================
+<?php
+/**
+ * class-api-controller.php
+ *
+ * 提供分布式 AI 系统所需的 REST API 端点：
+ *  - 节点相关 (Nodes)：
+ *      1. POST   /api/v1/nodes/register    注册节点
+ *      2. GET    /api/v1/nodes             列出所有节点
+ *      3. GET    /api/v1/nodes/<id>        获取单个节点信息
+ *      4. DELETE /api/v1/nodes/<id>        删除节点
+ *
+ *  - 任务相关 (Tasks)：
+ *      1. POST   /api/v1/tasks/create      创建新任务
+ *      2. GET    /api/v1/tasks             列出所有任务
+ *      3. GET    /api/v1/tasks/<id>        获取单个任务信息
+ *      4. POST   /api/v1/tasks/pull        节点拉取待处理任务
+ *      5. POST   /api/v1/tasks/complete    回报任务完成或失败
+ *      6. DELETE /api/v1/tasks/<id>        删除任务
+ *
+ * 鉴权：
+ *  - check_auth()：使用 Bearer Token 验证，仅允许已注册节点访问
+ *  - check_auth_or_custom_rule()：若请求带有预设 secret_key，则允许（适用于第三方系统直接创建任务），否则回退至 check_auth()。
+ *
+ * 所有端点均返回 WP_REST_Response 或 WP_Error，并使用适当 HTTP 状态码。
+ *
+ * @package AIContentGenerator
+ * @version 1.0
+ */
+
+namespace AICG\Includes;
+
+use WP_Error;
+use WP_REST_Request;
+use WP_REST_Response;
+
+if (!defined('ABSPATH')) {
+    exit;
+}
+
+class Api_Controller {
+
+    /**
+     * REST API 路径命名空间（含版本）
+     */
+    const NAMESPACE = 'api/v1';
+
+    /**
+     * 注册所有 REST API 路由
+     *
+     * @return void
+     */
+    public static function register_routes() {
+        // =========== 节点 (Nodes) API ===========
+        // (N1) 注册节点
+        register_rest_route(
+            self::NAMESPACE,
+            '/nodes/register',
+            [
+                'methods'             => 'POST',
+                'callback'            => [__CLASS__, 'register_node'],
+                'permission_callback' => '__return_true', // 开放注册（根据需求可调整）
+            ]
+        );
+
+        // (N2) 列出所有节点
+        register_rest_route(
+            self::NAMESPACE,
+            '/nodes',
+            [
+                'methods'             => 'GET',
+                'callback'            => [__CLASS__, 'list_nodes'],
+                'permission_callback' => [__CLASS__, 'check_auth'], // 仅允许授权节点（或管理员）
+            ]
+        );
+
+        // (N3) 获取单个节点信息
+        register_rest_route(
+            self::NAMESPACE,
+            '/nodes/(?P<id>\d+)',
+            [
+                'methods'             => 'GET',
+                'callback'            => [__CLASS__, 'get_node'],
+                'permission_callback' => [__CLASS__, 'check_auth'],
+            ]
+        );
+
+        // (N4) 删除节点
+        register_rest_route(
+            self::NAMESPACE,
+            '/nodes/(?P<id>\d+)',
+            [
+                'methods'             => 'DELETE',
+                'callback'            => [__CLASS__, 'delete_node'],
+                'permission_callback' => [__CLASS__, 'check_auth_or_custom_rule'],
+            ]
+        );
+
+        // =========== 任务 (Tasks) API ===========
+        // (T1) 创建任务
+        register_rest_route(
+            self::NAMESPACE,
+            '/tasks/create',
+            [
+                'methods'             => 'POST',
+                'callback'            => [__CLASS__, 'create_task'],
+                'permission_callback' => [__CLASS__, 'check_auth_or_custom_rule'],
+            ]
+        );
+
+        // (T2) 列出所有任务
+        register_rest_route(
+            self::NAMESPACE,
+            '/tasks',
+            [
+                'methods'             => 'GET',
+                'callback'            => [__CLASS__, 'list_tasks'],
+                'permission_callback' => [__CLASS__, 'check_auth'],
+            ]
+        );
+
+        // (T3) 获取单个任务信息
+        register_rest_route(
+            self::NAMESPACE,
+            '/tasks/(?P<id>\d+)',
+            [
+                'methods'             => 'GET',
+                'callback'            => [__CLASS__, 'get_task'],
+                'permission_callback' => [__CLASS__, 'check_auth'],
+            ]
+        );
+
+        // (T4) 节点拉取任务
+        register_rest_route(
+            self::NAMESPACE,
+            '/tasks/pull',
+            [
+                'methods'             => 'POST',
+                'callback'            => [__CLASS__, 'pull_task'],
+                'permission_callback' => [__CLASS__, 'check_auth'],
+            ]
+        );
+
+        // (T5) 回报任务完成/失败
+        register_rest_route(
+            self::NAMESPACE,
+            '/tasks/complete',
+            [
+                'methods'             => 'POST',
+                'callback'            => [__CLASS__, 'complete_task'],
+                'permission_callback' => [__CLASS__, 'check_auth'],
+            ]
+        );
+        register_rest_route(
+            self::NAMESPACE, 
+            '/nodes/last_heartbeat', 
+            [
+                'methods' => 'POST',
+                'callback' => [__CLASS__, 'update_last_heartbeat'],
+                'permission_callback' => [__CLASS__, 'check_auth'],
+            ]
+        );
+
+        // (T6) 删除任务
+        register_rest_route(
+            self::NAMESPACE,
+            '/tasks/(?P<id>\d+)',
+            [
+                'methods'             => 'DELETE',
+                'callback'            => [__CLASS__, 'delete_task'],
+                'permission_callback' => [__CLASS__, 'check_auth_or_custom_rule'],
+            ]
+        );
+        
+    }
+
+    /**
+     * -----------------------------
+     *        鉴权验证区
+     * -----------------------------
+     */
+
+    /**
+     * 检查 Bearer Token，仅允许已注册的节点访问
+     *
+     * @param WP_REST_Request $request
+     * @return true|WP_Error
+     */
+    public static function check_auth(WP_REST_Request $request) {
+        $auth_header = $request->get_header('authorization');
+        if (empty($auth_header)) {
+            return new WP_Error(
+                'no_auth_header',
+                __('Missing Authorization header', 'ai-content-generator'),
+                ['status' => 401]
+            );
+        }
+        if (stripos($auth_header, 'bearer ') !== 0) {
+            return new WP_Error(
+                'invalid_auth_header',
+                __('Invalid Authorization header format', 'ai-content-generator'),
+                ['status' => 401]
+            );
+        }
+        $token = trim(substr($auth_header, 7));
+        $node_manager = Node_Manager::instance();
+        $node = $node_manager->get_node_by_token($token);
+        if (!$node) {
+            return new WP_Error(
+                'invalid_token',
+                __('Invalid Bearer token', 'ai-content-generator'),
+                ['status' => 401]
+            );
+        }
+        // 更新节点心跳
+        $node_manager->update_heartbeat($node->id);
+        // 将节点信息存入 request，方便后续使用
+        $request->set_param('node_id', $node->id);
+        $request->set_param('node_type', $node->node_type);
+        return true;
+    }
+
+
+   /**
+     * 自定义验证：若请求带有 secret_key（例如：ABC123），则允许；否则回退至 check_auth
+     *
+     * @param WP_REST_Request $request
+     * @return true|WP_Error
+     */
+    public static function check_auth_or_custom_rule(WP_REST_Request $request) {
+        $secret_key = $request->get_param('secret_key');
+        if ($secret_key === 'ABC123') {
+            return true;
+        }
+        return self::check_auth($request);
+    }
+
+    /**
+     * -----------------------------
+     *        节点相关 API
+     * -----------------------------
+     */
+
+    /**
+     * (N1) 注册节点
+     * POST /api/v1/nodes/register
+     *
+     * @param WP_REST_Request $request
+     * @return WP_REST_Response|WP_Error
+     */
+    public static function register_node(WP_REST_Request $request) {
+        $node_type = $request->get_param('node_type');
+        if (empty($node_type)) {
+            return new WP_Error(
+                'missing_node_type',
+                __('node_type is required', 'ai-content-generator'),
+                ['status' => 400]
+            );
+        }
+        try {
+            $node_manager = Node_Manager::instance();
+            $result = $node_manager->register_node($node_type);
+            $response_data = [
+                'node_id'       => $result['node_id'],
+                'auth_token'    => $result['auth_token'],
+                'registered_at' => current_time('mysql'),
+            ];
+            return new WP_REST_Response($response_data, 200);
+        } catch (\Exception $e) {
+            return new WP_Error(
+                'node_registration_failed',
+                $e->getMessage(),
+                ['status' => 500]
+            );
+        }
+    }
+
+    /**
+     * (N2) 列出所有节点
+     * GET /api/v1/nodes
+     *
+     * @param WP_REST_Request $request
+     * @return WP_REST_Response
+     */
+    public static function list_nodes(WP_REST_Request $request) {
+        $node_manager = Node_Manager::instance();
+        $limit  = intval($request->get_param('limit')) ?: 50;
+        $offset = intval($request->get_param('offset')) ?: 0;
+        $nodes = $node_manager->get_all_nodes($limit, $offset);
+        return new WP_REST_Response(['nodes' => $nodes], 200);
+    }
+
+    /**
+     * (N3) 获取单个节点信息
+     * GET /api/v1/nodes/<id>
+     *
+     * @param WP_REST_Request $request
+     * @return WP_REST_Response|WP_Error
+     */
+    public static function get_node(WP_REST_Request $request) {
+        $node_id = intval($request->get_param('id'));
+        if ($node_id <= 0) {
+            return new WP_Error(
+                'invalid_node_id',
+                __('Node ID is invalid', 'ai-content-generator'),
+                ['status' => 400]
+            );
+        }
+        $node_manager = Node_Manager::instance();
+        $node = $node_manager->get_node($node_id);
+        if (!$node) {
+            return new WP_Error(
+                'node_not_found',
+                __('Node not found', 'ai-content-generator'),
+                ['status' => 404]
+            );
+        }
+        return new WP_REST_Response(['node' => $node], 200);
+    }
+
+    /**
+     * (N4) 删除节点
+     * DELETE /api/v1/nodes/<id>
+     *
+     * @param WP_REST_Request $request
+     * @return WP_REST_Response|WP_Error
+     */
+    public static function delete_node(WP_REST_Request $request) {
+        $node_id = intval($request->get_param('id'));
+        if ($node_id <= 0) {
+            return new WP_Error(
+                'invalid_node_id',
+                __('Node ID is invalid', 'ai-content-generator'),
+                ['status' => 400]
+            );
+        }
+        $node_manager = Node_Manager::instance();
+        $deleted = $node_manager->delete_node($node_id);
+        if (!$deleted) {
+            return new WP_Error(
+                'delete_node_failed',
+                __('No node deleted (possibly not found)', 'ai-content-generator'),
+                ['status' => 404]
+            );
+        }
+        return new WP_REST_Response(['success' => true, 'deleted_node_id' => $node_id], 200);
+    }
+
+    /**
+     * -----------------------------
+     *        任务相关 API
+     * -----------------------------
+     */
+
+    /**
+     * (T1) 创建任务
+     * POST /api/v1/tasks/create
+     *
+     * @param WP_REST_Request $request
+     * @return WP_REST_Response|WP_Error
+     */
+    public static function create_task(WP_REST_Request $request) {
+        $content_type    = $request->get_param('content_type');
+        $content_payload = $request->get_param('content_payload');
+        $webhook_url     = $request->get_param('webhook_url');
+
+        if (empty($content_type)) {
+            return new WP_Error(
+                'missing_content_type',
+                __('content_type is required', 'ai-content-generator'),
+                ['status' => 400]
+            );
+        }
+
+        try {
+            $task_manager = Task_Manager::instance();
+            $task_id = $task_manager->create_task($content_type, $content_payload, $webhook_url);
+            $new_task = $task_manager->get_task($task_id);
+            $response_data = [
+                'task_id'         => (int)$task_id,
+                'status'          => $new_task->status,
+                'content_type'    => $new_task->content_type,
+                'content_payload' => $new_task->content_payload,
+                'webhook_url'     => $new_task->webhook_url,
+                'created_at'      => $new_task->created_at,
+            ];
+            return new WP_REST_Response($response_data, 201);
+        } catch (\Exception $e) {
+            return new WP_Error(
+                'create_task_failed',
+                $e->getMessage(),
+                ['status' => 500]
+            );
+        }
+    }
+
+    /**
+     * (T2) 列出所有任务
+     * GET /api/v1/tasks
+     *
+     * @param WP_REST_Request $request
+     * @return WP_REST_Response
+     */
+    public static function list_tasks(WP_REST_Request $request) {
+        $task_manager = Task_Manager::instance();
+        $status  = $request->get_param('status'); // 可选：pending, in_progress, completed, failed
+        $limit   = intval($request->get_param('limit')) ?: 50;
+        $offset  = intval($request->get_param('offset')) ?: 0;
+        $tasks   = $task_manager->get_all_tasks($status, $limit, $offset);
+        return new WP_REST_Response(['tasks' => $tasks], 200);
+    }
+
+    /**
+     * (T3) 获取单个任务信息
+     * GET /api/v1/tasks/<id>
+     *
+     * @param WP_REST_Request $request
+     * @return WP_REST_Response|WP_Error
+     */
+    public static function get_task(WP_REST_Request $request) {
+        $task_id = intval($request->get_param('id'));
+        if ($task_id <= 0) {
+            return new WP_Error(
+                'invalid_task_id',
+                __('Task ID is invalid', 'ai-content-generator'),
+                ['status' => 400]
+            );
+        }
+        $task_manager = Task_Manager::instance();
+        $task = $task_manager->get_task($task_id);
+        if (!$task) {
+            return new WP_Error(
+                'task_not_found',
+                __('Task not found', 'ai-content-generator'),
+                ['status' => 404]
+            );
+        }
+        return new WP_REST_Response(['task' => $task], 200);
+    }
+
+    /**
+     * (T4) 节点拉取任务
+     * POST /api/v1/tasks/pull
+     *
+     * @param WP_REST_Request $request
+     * @return WP_REST_Response
+     */
+    public static function pull_task(WP_REST_Request $request) {
+        $node_type = $request->get_param('node_type');
+        $task_manager = Task_Manager::instance();
+        $task = $task_manager->fetch_pending_task($node_type);
+        if (!$task) {
+            return new WP_REST_Response(null, 204);
+        }
+        $response_data = [
+            'task_id'         => (int)$task->id,
+            'content_type'    => $task->content_type,
+            'content_payload' => $task->content_payload,
+            'webhook_url'     => $task->webhook_url,
+            'digital_id'      => 'task_' . $task->id . '_' . wp_generate_uuid4(),
+            'status'          => 'in_progress',
+        ];
+        return new WP_REST_Response($response_data, 200);
+    }
+
+    /**
+     * (T5) 回报任务完成或失败
+     * POST /api/v1/tasks/complete
+     *
+     * @param WP_REST_Request $request
+     * @return WP_REST_Response|WP_Error
+     */
+    public static function complete_task(WP_REST_Request $request) {
+        $task_id    = $request->get_param('task_id');
+        $status     = $request->get_param('status');
+        $result_url = $request->get_param('result_url');
+        $error_msg  = $request->get_param('error_message');
+
+        if (empty($task_id) || empty($status)) {
+            return new WP_Error(
+                'missing_params',
+                __('task_id and status are required', 'ai-content-generator'),
+                ['status' => 400]
+            );
+        }
+
+        $task_manager = Task_Manager::instance();
+        $task_obj = $task_manager->get_task($task_id);
+        if (!$task_obj) {
+            return new WP_Error(
+                'task_not_found',
+                __('Task does not exist', 'ai-content-generator'),
+                ['status' => 404]
+            );
+        }
+
+        $task_manager->update_task_status($task_id, $status, $result_url, $error_msg);
+        $updated_task = $task_manager->get_task($task_id);
+
+        // 若有 webhook_url 且状态不为 in_progress，则触发 Webhook 回调
+        if (!empty($updated_task->webhook_url) && $status !== 'in_progress') {
+            \AICG\Includes\Webhook_Handler::send_webhook_notification($updated_task);
+        }
+
+        $response_data = [
+            'success' => true,
+            'message' => 'Task result recorded',
+            'task'    => [
+                'id'         => (int)$updated_task->id,
+                'status'     => $updated_task->status,
+                'result_url' => $updated_task->result_url,
+            ]
+        ];
+        return new WP_REST_Response($response_data, 200);
+    }
+
+    /**
+     * (T6) 删除任务
+     * DELETE /api/v1/tasks/<id>
+     *
+     * @param WP_REST_Request $request
+     * @return WP_REST_Response|WP_Error
+     */
+    public static function delete_task(WP_REST_Request $request) {
+        $task_id = intval($request->get_param('id'));
+        if ($task_id <= 0) {
+            return new WP_Error(
+                'invalid_task_id',
+                __('Task ID is invalid', 'ai-content-generator'),
+                ['status' => 400]
+            );
+        }
+        $task_manager = Task_Manager::instance();
+        $deleted = $task_manager->delete_task($task_id);
+        if (!$deleted) {
+            return new WP_Error(
+                'delete_task_failed',
+                __('No task deleted (possibly not found)', 'ai-content-generator'),
+                ['status' => 404]
+            );
+        }
+        return new WP_REST_Response(['success' => true, 'deleted_task_id' => $task_id], 200);
+    }
+    public static function update_last_heartbeat(WP_REST_Request $request) {
+        //$auth_token = $request->get_header('Authorization');
+        $auth_header = $request->get_header('Authorization');
+        if (empty($auth_header)) {
+            return new WP_Error(
+                'no_auth_header',
+                __('Missing Authorization header', 'ai-content-generator'),
+                ['status' => 401]
+            );
+        }
+        if (stripos($auth_header, 'Bearer ') !== 0) {
+            return new WP_Error(
+                'invalid_auth_header',
+                __('Invalid Authorization header format', 'ai-content-generator'),
+                ['status' => 401]
+            );
+        }
+        $token = trim(substr($auth_header, 7));
+        $node_manager = Node_Manager::instance();
+        $node = $node_manager->get_node_by_token($token);
+        if (!$node) {
+            return new WP_Error('invalid_token', 'Invalid auth token', ['status' => 401]);
+        }
+        
+        // 更新节点心跳时间
+        $node_manager = Node_Manager::instance();
+        $node_manager->update_heartbeat($node->id);
+    
+        return new WP_REST_Response('Heartbeat updated successfully', 200);
+    }
+    
+}
+
+目錄：/www/wwwroot/xart003.heatgroups.top/wp-content/plugins/ai-content-generator-plugin/includes
+檔名：class-task-manager.php
+==================================================
+<?php
+/**
+ * class-task-manager.php
+ *
+ * Task_Manager 类负责 WordPress 中 AI 内容生产任务 (Tasks) 的管理：
+ *  1. 创建新任务 (create_task)
+ *  2. 获取并锁定一个待处理任务 (fetch_pending_task)
+ *  3. 更新任务状态 (update_task_status)
+ *  4. 查询单个任务 (get_task)
+ *  5. 获取所有任务 (get_all_tasks)
+ *  6. 删除任务 (delete_task)
+ *  7. 批量更新任务状态 (batch_update_status)
+ *  8. 根据 content_type 筛选任务 (get_tasks_by_content_type)
+ *  9. 统计任务状态数量 (count_tasks_by_status)
+ * 10. 关键字搜寻任务 (search_tasks)
+ * 11. 定期处理逾期任务 (handle_scheduled_tasks)
+ *
+ * @package AIContentGenerator
+ * @version 1.0
+ */
+
+namespace AICG\Includes;
+
+use wpdb;
+use Exception;
+
+if (!defined('ABSPATH')) {
+    exit; // 防止直接访问文件
+}
+
+class Task_Manager {
+
+    /**
+     * 单例 (Singleton) 实例
+     *
+     * @var Task_Manager|null
+     */
+    protected static $instance = null;
+
+    /**
+     * 数据表名称 (通常为 wp_ai_tasks)
+     *
+     * @var string
+     */
+    protected $table_name;
+
+    /**
+     * 获取单例实例
+     *
+     * @return Task_Manager
+     */
+    public static function instance() {
+        if (is_null(self::$instance)) {
+            self::$instance = new self();
+        }
+        return self::$instance;
+    }
+
+    /**
+     * 构造函数：初始化数据表名称
+     */
+    private function __construct() {
+        global $wpdb;
+        $this->table_name = $wpdb->prefix . 'ai_tasks';
+    }
+
+    /**
+     * 创建或更新任务数据表
+     *
+     * 此方法应在插件启用时调用，创建或更新任务表结构，
+     * 包含 webhook 相关字段： webhook_failed, webhook_retry_count, last_webhook_attempt。
+     *
+     * @return void
+     */
+    public function create_tables() {
+        global $wpdb;
+        $charset_collate = $wpdb->get_charset_collate();
+        $sql = "CREATE TABLE IF NOT EXISTS {$this->table_name} (
+            id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+            content_type VARCHAR(50) NOT NULL,
+            content_payload TEXT DEFAULT NULL,
+            status VARCHAR(20) NOT NULL DEFAULT 'pending',
+            result_url TEXT DEFAULT NULL,
+            webhook_url TEXT DEFAULT NULL,
+            retry_count INT UNSIGNED NOT NULL DEFAULT 0,
+            webhook_failed TINYINT(1) NOT NULL DEFAULT 0,
+            webhook_retry_count INT UNSIGNED NOT NULL DEFAULT 0,
+            last_webhook_attempt DATETIME DEFAULT NULL,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            PRIMARY KEY (id),
+            KEY idx_status (status)
+        ) $charset_collate;";
+        require_once(ABSPATH . 'wp-admin/includes/upgrade.php');
+        dbDelta($sql);
+    }
+
+    /**
+     * 创建新任务
+     *
+     * @param string $content_type     任务类型 (例如: image, text, printing 等)
+     * @param string $content_payload  任务参数 (可以是 JSON 字符串)
+     * @param string $webhook_url      任务完成后回调的 Webhook URL
+     * @return int 新任务的 ID
+     * @throws Exception 如果数据库插入失败
+     */
+    public function create_task($content_type, $content_payload = '', $webhook_url = '') {
+        global $wpdb;
+        $result = $wpdb->insert(
+            $this->table_name,
+            [
+                'content_type'    => $content_type,
+                'content_payload' => $content_payload,
+                'status'          => 'pending',
+                'webhook_url'     => $webhook_url,
+                'created_at'      => current_time('mysql'),
+                'updated_at'      => current_time('mysql')
+            ],
+            ['%s', '%s', '%s', '%s', '%s', '%s']
+        );
+        if ($result === false) {
+            throw new Exception('Unable to create task. Database insert failed.');
+        }
+        return $wpdb->insert_id;
+    }
+
+    /**
+     * 获取并锁定一个待处理 (pending) 任务
+     *
+     * 此方法使用 SQL 事务与 FOR UPDATE 锁定最早的一个 pending 任务，
+     * 并将其状态更新为 in_progress，防止多个节点同时获取相同任务。
+     *
+     * @param string $node_type 可选参数，如果需要根据节点能力筛选任务，可以在此加入条件
+     * @return object|false 如果获取到任务对象则返回，否则返回 false
+     */
+    public function fetch_pending_task($node_type = '') {
+        global $wpdb;
+        $wpdb->query('START TRANSACTION');
+        // 如果需要根据 $node_type 增加条件，可以修改下面 SQL
+        $task = $wpdb->get_row(
+            "SELECT * FROM {$this->table_name}
+             WHERE status = 'pending'
+             ORDER BY id ASC
+             LIMIT 1
+             FOR UPDATE"
+        );
+        if ($task) {
+            $wpdb->update(
+                $this->table_name,
+                [
+                    'status'     => 'in_progress',
+                    'updated_at' => current_time('mysql')
+                ],
+                ['id' => $task->id],
+                ['%s', '%s'],
+                ['%d']
+            );
+            $wpdb->query('COMMIT');
+            return $task;
+        }
+        $wpdb->query('COMMIT');
+        return false;
+    }
+
+    /**
+     * 更新任务状态
+     *
+     * @param int $task_id 任务 ID
+     * @param string $status 新状态 (例如: completed, failed, in_progress)
+     * @param string|null $result_url 结果 URL (如果有生成结果)
+     * @param string|null $error_msg 失败时错误信息 (可选)
+     * @return void
+     */
+    public function update_task_status($task_id, $status, $result_url = null, $error_msg = null) {
+        global $wpdb;
+        $fields = [
+            'status'     => $status,
+            'updated_at' => current_time('mysql')
+        ];
+        if ($result_url !== null) {
+            $fields['result_url'] = $result_url;
+        }
+        if ($status === 'failed') {
+            $current_retry = (int)$wpdb->get_var($wpdb->prepare(
+                "SELECT retry_count FROM {$this->table_name} WHERE id = %d",
+                $task_id
+            ));
+            $fields['retry_count'] = $current_retry + 1;
+        }
+        $wpdb->update(
+            $this->table_name,
+            $fields,
+            ['id' => $task_id],
+            array_map(function($val) { return '%s'; }, $fields),
+            ['%d']
+        );
+    }
+
+    /**
+     * 获取单个任务信息
+     *
+     * @param int $task_id 任务 ID
+     * @return object|null 任务对象或 null
+     */
+    public function get_task($task_id) {
+        global $wpdb;
+        $sql = $wpdb->prepare("SELECT * FROM {$this->table_name} WHERE id = %d", $task_id);
+        return $wpdb->get_row($sql);
+    }
+
+    /**
+     * 获取所有任务，支持按状态筛选与分页
+     *
+     * @param string $status 可选筛选状态 (例如: pending, in_progress, completed, failed)
+     * @param int $limit 每次获取条数
+     * @param int $offset 从哪个位置开始
+     * @return array 任务对象数组
+     */
+    public function get_all_tasks($status = '', $limit = 50, $offset = 0) {
+        global $wpdb;
+        $where_sql = '';
+        if (!empty($status)) {
+            $where_sql = $wpdb->prepare(" WHERE status = %s ", $status);
+        }
+        $sql = "SELECT * FROM {$this->table_name} {$where_sql} ORDER BY id DESC LIMIT %d OFFSET %d";
+        $sql = $wpdb->prepare($sql, $limit, $offset);
+        $results = $wpdb->get_results($sql);
+        return $results ? $results : [];
+    }
+
+    /**
+     * 删除指定任务
+     *
+     * @param int $task_id 任务 ID
+     * @return bool 如果成功删除返回 true，否则 false
+     */
+    public function delete_task($task_id) {
+        global $wpdb;
+        $deleted = $wpdb->delete($this->table_name, ['id' => $task_id], ['%d']);
+        return ($deleted !== false && $deleted > 0);
+    }
+
+    /**
+     * 批量更新多条任务状态
+     *
+     * @param array $task_ids 任务 ID 数组
+     * @param string $status 新状态
+     * @param string|null $result_url 可选，共同的结果 URL
+     * @param string|null $error_msg 可选，错误信息
+     * @return int 成功更新的条数
+     */
+    public function batch_update_status(array $task_ids, $status, $result_url = null, $error_msg = null) {
+        global $wpdb;
+        if (empty($task_ids)) {
+            return 0;
+        }
+        $placeholders = implode(',', array_fill(0, count($task_ids), '%d'));
+        $fields_sql = "status = %s, updated_at = %s";
+        $params = [$status, current_time('mysql')];
+        if ($result_url !== null) {
+            $fields_sql .= ", result_url = %s";
+            $params[] = $result_url;
+        }
+        if ($status === 'failed') {
+            $fields_sql .= ", retry_count = retry_count + 1";
+        }
+        $params = array_merge($params, $task_ids);
+        $sql = "UPDATE {$this->table_name} SET {$fields_sql} WHERE id IN ({$placeholders})";
+        $prepared_sql = $wpdb->prepare($sql, $params);
+        $result = $wpdb->query($prepared_sql);
+        return $result === false ? 0 : (int)$result;
+    }
+
+    /**
+     * 根据 content_type 获取任务
+     *
+     * @param string $content_type 例如: image, text, printing 等
+     * @param int $limit 条数上限
+     * @param int $offset 偏移量
+     * @return array 任务对象数组
+     */
+    public function get_tasks_by_content_type($content_type, $limit = 50, $offset = 0) {
+        global $wpdb;
+        $sql = "SELECT * FROM {$this->table_name} WHERE content_type = %s ORDER BY id DESC LIMIT %d OFFSET %d";
+        $prepared_sql = $wpdb->prepare($sql, $content_type, $limit, $offset);
+        $results = $wpdb->get_results($prepared_sql);
+        return $results ? $results : [];
+    }
+
+    /**
+     * 统计任务状态数量
+     *
+     * @param string|null $status 如果提供，返回该状态的数量；否则返回所有状态的关联数组
+     * @return int|array
+     */
+    public function count_tasks_by_status($status = null) {
+        global $wpdb;
+        if (!is_null($status)) {
+            $sql = $wpdb->prepare("SELECT COUNT(*) FROM {$this->table_name} WHERE status = %s", $status);
+            return (int)$wpdb->get_var($sql);
+        } else {
+            $sql = "SELECT status, COUNT(*) AS total FROM {$this->table_name} GROUP BY status";
+            $results = $wpdb->get_results($sql);
+            $counts = [];
+            if ($results) {
+                foreach ($results as $row) {
+                    $counts[$row->status] = (int)$row->total;
+                }
+            }
+            return $counts;
+        }
+    }
+
+    /**
+     * 在任务中做关键字搜寻
+     *
+     * @param string $keyword 搜寻关键字
+     * @param int $limit 条数上限
+     * @param int $offset 偏移量
+     * @return array 匹配的任务对象数组
+     */
+    public function search_tasks($keyword, $limit = 50, $offset = 0) {
+        global $wpdb;
+        $like_pattern = '%' . $wpdb->esc_like($keyword) . '%';
+        $sql = "SELECT * FROM {$this->table_name} WHERE content_payload LIKE %s OR content_type LIKE %s ORDER BY id DESC LIMIT %d OFFSET %d";
+        $prepared_sql = $wpdb->prepare($sql, $like_pattern, $like_pattern, $limit, $offset);
+        $results = $wpdb->get_results($prepared_sql);
+        return $results ? $results : [];
+    }
+
+    /**
+     * 定期处理逾期任务
+     *
+     * 例如：将超过 30 分钟未更新的 in_progress 任务转为 failed 并增加重试次数
+     *
+     * @return void
+     */
+    public static function handle_scheduled_tasks() {
+        global $wpdb;
+        $instance = self::instance();
+        $timeout_threshold = 1800; // 30 分钟
+        $current_time = current_time('timestamp');
+        $deadline_unix = $current_time - $timeout_threshold;
+        $deadline_str = gmdate('Y-m-d H:i:s', $deadline_unix);
+        $table = $instance->table_name;
+        $sql = $wpdb->prepare("SELECT id FROM {$table} WHERE status = 'in_progress' AND updated_at < %s", $deadline_str);
+        $overdue_tasks = $wpdb->get_col($sql);
+        if (!empty($overdue_tasks)) {
+            $instance->batch_update_status($overdue_tasks, 'failed', null, 'Task timed out');
+        }
+    }
+}
+
+目錄：/www/wwwroot/xart003.heatgroups.top/wp-content/plugins/ai-content-generator-plugin/includes
+檔名：class-node-manager.php
+==================================================
+<?php
+/**
+ * class-node-manager.php
+ *
+ * Node_Manager 类负责 WordPress 中 AI 节点 (Nodes) 的管理：
+ *  - 节点注册 (register_node)
+ *  - 根据 auth_token 获取节点 (get_node_by_token)
+ *  - 根据 node_id 获取节点 (get_node)
+ *  - 更新节点心跳 (update_heartbeat)
+ *  - 获取所有节点 (get_all_nodes)
+ *  - 删除节点 (delete_node)
+ *  - 批量更新节点类型 (batch_update_node_types)
+ *  - 搜索节点 (search_nodes)
+ *
+ * @package AIContentGenerator
+ * @version 1.0
+ */
+
+namespace AICG\Includes;
+
+use wpdb;
+use Exception;
+
+if (!defined('ABSPATH')) {
+    exit; // 防止直接访问文件
+}
+
+class Node_Manager {
+
+    /**
+     * 单例 (Singleton) 实例
+     *
+     * @var Node_Manager|null
+     */
+    protected static $instance = null;
+
+    /**
+     * 数据表名称 (通常为 wp_ai_nodes)
+     *
+     * @var string
+     */
+    protected $table_name;
+
+    /**
+     * 获取 Node_Manager 的单例实例
+     *
+     * @return Node_Manager
+     */
+    public static function instance() {
+        if (is_null(self::$instance)) {
+            self::$instance = new self();
+        }
+        return self::$instance;
+    }
+
+    /**
+     * 构造函数：初始化数据表名称
+     */
+    private function __construct() {
+        global $wpdb;
+        $this->table_name = $wpdb->prefix . 'ai_nodes';
+    }
+
+    /**
+     * 创建或更新节点数据表
+     *
+     * 此方法应在插件启用时调用，创建或更新节点表结构。
+     *
+     * @return void
+     */
+    public function create_tables() {
+        global $wpdb;
+        $charset_collate = $wpdb->get_charset_collate();
+        $sql = "CREATE TABLE IF NOT EXISTS {$this->table_name} (
+            id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+            node_type VARCHAR(50) NOT NULL,
+            auth_token VARCHAR(100) NOT NULL,
+            last_heartbeat DATETIME DEFAULT CURRENT_TIMESTAMP,
+            registered_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (id),
+            KEY idx_type (node_type)
+        ) $charset_collate;";
+        require_once(ABSPATH . 'wp-admin/includes/upgrade.php');
+        dbDelta($sql);
+    }
+
+    /**
+     * 注册一个新节点，并生成唯一的 auth_token。
+     *
+     * @param string $node_type 节点类型，例如 "stable_diffusion", "openai", "printing_node" 等。
+     * @param string|null $custom_token 可选参数，如果需要自定义 Token，否则自动生成。
+     * @return array 包含 'node_id' 和 'auth_token' 的数组。
+     * @throws Exception 如果数据库插入失败，则抛出 Exception。
+     */
+    public function register_node($node_type, $custom_token = null) {
+        global $wpdb;
+        $auth_token = $custom_token;
+        if (empty($auth_token)) {
+            // 使用 wp_generate_password() 生成 32 字符不含特殊符号的随机 Token
+            $auth_token = wp_generate_password(32, false);
+        }
+        $result = $wpdb->insert(
+            $this->table_name,
+            [
+                'node_type'     => $node_type,
+                'auth_token'    => $auth_token,
+                'registered_at' => current_time('mysql'),
+                'last_heartbeat' => current_time('mysql')
+            ],
+            ['%s', '%s', '%s', '%s']
+        );
+        if ($result === false) {
+            throw new Exception('Unable to register node. Database insert failed.');
+        }
+        return [
+            'node_id'    => $wpdb->insert_id,
+            'auth_token' => $auth_token
+        ];
+    }
+
+    /**
+     * 根据节点 ID 获取单个节点信息
+     *
+     * @param int $node_id 节点 ID
+     * @return object|null 如果找到则返回该节点数据对象；否则返回 null。
+     */
+    public function get_node($node_id) {
+        global $wpdb;
+        $sql = $wpdb->prepare("SELECT * FROM {$this->table_name} WHERE id = %d LIMIT 1", $node_id);
+        return $wpdb->get_row($sql);
+    }
+
+    /**
+     * 根据 auth_token 获取单个节点信息
+     *
+     * @param string $auth_token 节点验证 Token
+     * @return object|null 如果找到则返回该节点数据对象；否则返回 null。
+     */
+    public function get_node_by_token($auth_token) {
+        global $wpdb;
+        $sql = $wpdb->prepare("SELECT * FROM {$this->table_name} WHERE auth_token = %s LIMIT 1", $auth_token);
+        return $wpdb->get_row($sql);
+    }
+
+    /**
+     * 更新节点最后心跳 (Heartbeat)
+     *
+     * 更新节点的 last_heartbeat 字段为当前时间，表示该节点仍处于存活状态。
+     *
+     * @param int $node_id 节点 ID
+     * @return bool 如果更新成功则返回 true；否则返回 false。
+     */
+    public function update_heartbeat($node_id) {
+        global $wpdb;
+        $result = $wpdb->update(
+            $this->table_name,
+            ['last_heartbeat' => current_time('mysql')],
+            ['id' => $node_id],
+            ['%s'],
+            ['%d']
+        );
+        return $result !== false;
+    }
+
+    /**
+     * 获取所有节点 (支持分页)
+     *
+     * @param int $limit 每次返回的节点数量上限
+     * @param int $offset 从哪个位置开始
+     * @return array 节点数据对象数组
+     */
+    public function get_all_nodes($limit = 50, $offset = 0) {
+        global $wpdb;
+        $sql = $wpdb->prepare(
+            "SELECT * FROM {$this->table_name} ORDER BY id DESC LIMIT %d OFFSET %d",
+            $limit,
+            $offset
+        );
+        $results = $wpdb->get_results($sql);
+        return $results ? $results : [];
+    }
+
+    /**
+     * 删除指定节点
+     *
+     * @param int $node_id 节点 ID
+     * @return bool 如果成功删除则返回 true；否则返回 false。
+     */
+    public function delete_node($node_id) {
+        global $wpdb;
+        $deleted = $wpdb->delete(
+            $this->table_name,
+            ['id' => $node_id],
+            ['%d']
+        );
+        return ($deleted !== false && $deleted > 0);
+    }
+
+    /**
+     * 批量更新节点类型
+     *
+     * 将多个节点一并更新为新的 node_type，并更新 last_heartbeat 为当前时间。
+     *
+     * @param array $node_ids 节点 ID 数组
+     * @param string $new_type 新的节点类型
+     * @return int 成功更新的节点数量
+     */
+    public function batch_update_node_types(array $node_ids, $new_type) {
+        global $wpdb;
+        if (empty($node_ids)) {
+            return 0;
+        }
+        $placeholders = implode(',', array_fill(0, count($node_ids), '%d'));
+        $sql = "UPDATE {$this->table_name} SET node_type = %s, last_heartbeat = %s WHERE id IN ({$placeholders})";
+        $params = array_merge([$new_type, current_time('mysql')], $node_ids);
+        $prepared_sql = $wpdb->prepare($sql, $params);
+        $result = $wpdb->query($prepared_sql);
+        return $result === false ? 0 : (int)$result;
+    }
+
+    /**
+     * 搜索节点
+     *
+     * 根据关键字对 node_type 和 auth_token 字段进行模糊搜索。
+     *
+     * @param string $keyword 搜索关键字
+     * @param int $limit 每次返回条数上限
+     * @param int $offset 偏移量
+     * @return array 匹配的节点数据对象数组
+     */
+    public function search_nodes($keyword, $limit = 50, $offset = 0) {
+        global $wpdb;
+        $like_pattern = '%' . $wpdb->esc_like($keyword) . '%';
+        $sql = "SELECT * FROM {$this->table_name} WHERE node_type LIKE %s OR auth_token LIKE %s ORDER BY id DESC LIMIT %d OFFSET %d";
+        $prepared_sql = $wpdb->prepare($sql, $like_pattern, $like_pattern, $limit, $offset);
+        $results = $wpdb->get_results($prepared_sql);
+        return $results ? $results : [];
+    }
+
+    /**
+     * 清理离线节点
+     *
+     * 将超过一定时间未更新心跳的节点标记为离线或删除。
+     *
+     * @return void
+     */
+    public function cleanup_offline_nodes() {
+        $timeout_threshold = 1800; // 30 分钟
+        $current_time = current_time('timestamp');
+        $deadline_unix = $current_time - $timeout_threshold;
+        $deadline_str = gmdate('Y-m-d H:i:s', $deadline_unix);
+        
+        global $wpdb;
+        $sql = $wpdb->prepare("SELECT id FROM {$this->table_name} WHERE last_heartbeat < %s", $deadline_str);
+        $offline_nodes = $wpdb->get_col($sql);
+        
+        if (!empty($offline_nodes)) {
+            foreach ($offline_nodes as $node_id) {
+                // 可在此处添加将节点标记为离线的逻辑
+                $this->update_node_status($node_id, 'offline');
+            }
+        }
+    }
+
+    /**
+     * 更新节点状态
+     *
+     * @param int $node_id 节点 ID
+     * @param string $status 新状态
+     * @return bool 更新是否成功
+     */
+    private function update_node_status($node_id, $status) {
+        global $wpdb;
+        $result = $wpdb->update(
+            $this->table_name,
+            ['status' => $status],
+            ['id' => $node_id],
+            ['%s'],
+            ['%d']
+        );
+        return $result !== false;
+    }
+/**
+ * 统计节点总数
+ *
+ * @return int 节点总数
+ */
+public function count_nodes() {
+    global $wpdb;
+    return $wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->prefix}ai_nodes");
+}
+
+/**
+ * 统计在线节点数（最后心跳在10分钟内的节点）
+ *
+ * @return int 在线节点数
+ */
+public function count_online_nodes() {
+    $timeout_threshold = 600; // 10分钟
+    $current_time = current_time('timestamp');
+    $deadline_unix = $current_time - $timeout_threshold;
+    $deadline_str = gmdate('Y-m-d H:i:s', $deadline_unix);
+    
+    global $wpdb;
+    $sql = $wpdb->prepare("SELECT COUNT(*) FROM {$wpdb->prefix}ai_nodes WHERE last_heartbeat >= %s", $deadline_str);
+    return $wpdb->get_var($sql);
+}    
+}
+
+目錄：/www/wwwroot/xart003.heatgroups.top/wp-content/plugins/ai-content-generator-plugin/includes
+檔名：class-webhook-handler.php
+==================================================
+<?php
+/**
+ * class-webhook-handler.php
+ *
+ * Webhook_Handler 类用于将任务执行结果、节点状态或其他信息回调到第三方系统，
+ * 并结合数据库字段管理回调失败与重试次数。同时整合外部队列 (RabbitMQ) 与进阶日志记录 (Monolog)
+ * 来实现分布式重试机制与详细除错记录。
+ *
+ * @package AIContentGenerator
+ * @version 1.0
+ */
+
+namespace AICG\Includes;
+
+if (!defined('ABSPATH')) {
+    exit; // 防止直接访问
+}
+
+// 引入 Monolog（若已安装）
+use Monolog\Logger;
+use Monolog\Handler\StreamHandler;
+
+// 引入 RabbitMQ 的 PhpAmqpLib（需透过 Composer 安装）
+use PhpAmqpLib\Connection\AMQPStreamConnection;
+use PhpAmqpLib\Message\AMQPMessage;
+
+class Webhook_Handler {
+
+    /**
+     * 预设的 Webhook secret key
+     * 建议从安全设定读取，这里示例为硬编码
+     *
+     * @var string
+     */
+    protected static $secret_key = 'my-production-webhook-secret';
+
+    /**
+     * Webhook 请求逾时秒数
+     *
+     * @var int
+     */
+    protected static $timeout = 10;
+
+    /**
+     * 最大重试次数（含首次发送）
+     *
+     * @var int
+     */
+    const MAX_RETRY = 3;
+
+    /**
+     * RabbitMQ 连线设定
+     */
+    const QUEUE_HOST     = 'localhost';
+    const QUEUE_PORT     = 5672;
+    const QUEUE_USER     = 'guest';
+    const QUEUE_PASSWORD = 'guest';
+    const QUEUE_NAME     = 'webhook_failures';
+
+    /**
+     * Monolog 日志档路径（请根据生产环境设定正确路径）
+     */
+    const LOG_FILE = '/var/log/ai-content-generator-webhook.log';
+
+    /**
+     * Monolog Logger 实例
+     *
+     * @var Logger|null
+     */
+    protected static $logger = null;
+
+    /**
+     * 获取或初始化 Logger 实例 (使用 Monolog)
+     *
+     * @return Logger
+     */
+    protected static function get_logger() {
+        if (self::$logger === null) {
+            try {
+                $logger = new Logger('WebhookHandler');
+                $logger->pushHandler(new StreamHandler(self::LOG_FILE, Logger::DEBUG));
+                self::$logger = $logger;
+            } catch (\Exception $e) {
+                error_log('Monolog initialization failed: ' . $e->getMessage());
+                self::$logger = null;
+            }
+        }
+        return self::$logger;
+    }
+
+    /**
+     * 发送 Webhook 通知
+     *
+     * 组合任务的关键资料（digital_id, result_url, status, timestamp），
+     * 使用 HMAC-SHA256 产生签名后以 JSON POST 至 $task->webhook_url，
+     * 并根据 HTTP 回应更新数据库中该任务的 webhook 状态。
+     *
+     * 若发送失败，除了更新数据库，也将失败讯息推送到外部队列以供分布式重试。
+     *
+     * @param object $task 任务物件（需包含 id, status, result_url, webhook_url）
+     * @return bool true 表示成功，false 表示失败
+     */
+    public static function send_webhook_notification($task) {
+        $logger = self::get_logger();
+        if (empty($task->webhook_url)) {
+            if ($logger) {
+                $logger->warning("Task #{$task->id} has no webhook_url defined.");
+            } else {
+                error_log("Task #{$task->id} has no webhook_url defined.");
+            }
+            return false;
+        }
+
+        // 组合 payload 资料
+        $digital_id  = 'task_' . $task->id;
+        $payload_str = $digital_id . '|' . (string)$task->result_url . '|' . (string)$task->status;
+        $signature   = hash_hmac('sha256', $payload_str, self::$secret_key);
+
+        $body = [
+            'digital_id' => $digital_id,
+            'result_url' => $task->result_url,
+            'status'     => $task->status,
+            'signature'  => $signature,
+            'timestamp'  => current_time('mysql'),
+        ];
+
+        $args = [
+            'headers' => ['Content-Type' => 'application/json'],
+            'body'    => json_encode($body),
+            'timeout' => self::$timeout,
+        ];
+
+        $response = wp_remote_post($task->webhook_url, $args);
+        $success = false;
+        if (is_wp_error($response)) {
+            $error_msg = $response->get_error_message();
+            if ($logger) {
+                $logger->error("Task #{$task->id} POST failed: " . $error_msg);
+            } else {
+                error_log("Task #{$task->id} POST failed: " . $error_msg);
+            }
+        } else {
+            $status_code = wp_remote_retrieve_response_code($response);
+            if ($status_code >= 200 && $status_code < 300) {
+                $success = true;
+            } else {
+                $resp_body = wp_remote_retrieve_body($response);
+                if ($logger) {
+                    $logger->error("Task #{$task->id} POST failed: HTTP {$status_code} => {$resp_body}");
+                } else {
+                    error_log("Task #{$task->id} POST failed: HTTP {$status_code} => {$resp_body}");
+                }
+            }
+        }
+
+        // 更新数据库中该任务的 webhook 状态
+        self::update_webhook_status($task->id, $success);
+
+        // 若发送失败且重试次数未达上限，推送至外部队列以供重试
+        if (!$success) {
+            self::maybe_publish_failed_webhook($task);
+        }
+        return $success;
+    }
+
+    /**
+     * 更新指定任务的 webhook 状态字段
+     *
+     * 更新逻辑：
+     *  - 成功发送：设置 webhook_failed = 0, webhook_retry_count = 0, last_webhook_attempt = 现在
+     *  - 失败发送：设置 webhook_failed = 1, webhook_retry_count 自增, last_webhook_attempt = 现在
+     *
+     * @param int  $task_id 任务 ID
+     * @param bool $success 是否成功发送
+     * @return void
+     */
+    protected static function update_webhook_status($task_id, $success) {
+        global $wpdb;
+        $table = $wpdb->prefix . 'ai_tasks';
+        $data = [
+            'last_webhook_attempt' => current_time('mysql'),
+        ];
+        if ($success) {
+            $data['webhook_failed'] = 0;
+            $data['webhook_retry_count'] = 0;
+        } else {
+            $current_retry = (int)$wpdb->get_var($wpdb->prepare("SELECT webhook_retry_count FROM {$table} WHERE id = %d", $task_id));
+            $data['webhook_failed'] = 1;
+            $data['webhook_retry_count'] = $current_retry + 1;
+        }
+        $wpdb->update($table, $data, ['id' => $task_id], ['%s', '%d', '%d'], ['%d']);
+    }
+
+    /**
+     * 尝试将失败的 Webhook 任务推送到外部队列
+     *
+     * 若重试次数未达上限，则将该任务信息推送至 RabbitMQ 队列供分布式重试。
+     *
+     * @param object $task 任务物件
+     * @return void
+     */
+    protected static function maybe_publish_failed_webhook($task) {
+        global $wpdb;
+        $table = $wpdb->prefix . 'ai_tasks';
+        $current_retry = (int)$wpdb->get_var($wpdb->prepare("SELECT webhook_retry_count FROM {$table} WHERE id = %d", $task->id));
+        if ($current_retry >= self::MAX_RETRY) {
+            $logger = self::get_logger();
+            if ($logger) {
+                $logger->warning("Task #{$task->id} reached max webhook retry count.");
+            } else {
+                error_log("Task #{$task->id} reached max webhook retry count.");
+            }
+            return;
+        }
+        $data = [
+            'task_id'     => $task->id,
+            'webhook_url' => $task->webhook_url,
+            'result_url'  => $task->result_url,
+            'status'      => $task->status,
+            'retry_count' => $current_retry,
+            'timestamp'   => current_time('mysql'),
+        ];
+        self::publish_to_queue($data);
+    }
+
+    /**
+     * 使用 RabbitMQ 推送失败的 Webhook 任务到外部队列
+     *
+     * 此方法透过 PhpAmqpLib 建立连线，并将 JSON 格式的讯息推送至指定队列。
+     *
+     * @param array $data 任务数据数组
+     * @return void
+     */
+    protected static function publish_to_queue($data) {
+        $logger = self::get_logger();
+        try {
+            $connection = new AMQPStreamConnection(
+                self::QUEUE_HOST,
+                self::QUEUE_PORT,
+                self::QUEUE_USER,
+                self::QUEUE_PASSWORD
+            );
+            $channel = $connection->channel();
+            // 宣告队列：如果不存在则建立
+            $channel->queue_declare(self::QUEUE_NAME, false, true, false, false);
+            $messageBody = json_encode($data);
+            $msg = new AMQPMessage($messageBody, ['delivery_mode' => AMQPMessage::DELIVERY_MODE_PERSISTENT]);
+            $channel->basic_publish($msg, '', self::QUEUE_NAME);
+            if ($logger) {
+                $logger->info("Published task #{$data['task_id']} to external queue.");
+            } else {
+                error_log("Published task #{$data['task_id']} to external queue.");
+            }
+            $channel->close();
+            $connection->close();
+        } catch (\Exception $e) {
+            if ($logger) {
+                $logger->error("Failed to publish task #{$data['task_id']} to external queue: " . $e->getMessage());
+            } else {
+                error_log("Failed to publish task #{$data['task_id']} to external queue: " . $e->getMessage());
+            }
+        }
+    }
+
+    /**
+     * 分布式重试机制
+     *
+     * 此方法示范由外部工作程序消费队列中的讯息，重新呼叫 send_webhook_notification()。
+     * 实际部署时，建议以独立的 worker 脚本处理此功能，避免阻塞 PHP 执行流程。
+     *
+     * @return void
+     */
+    public static function process_failed_webhook_queue() {
+        $logger = self::get_logger();
+        try {
+            $connection = new AMQPStreamConnection(
+                self::QUEUE_HOST,
+                self::QUEUE_PORT,
+                self::QUEUE_USER,
+                self::QUEUE_PASSWORD
+            );
+            $channel = $connection->channel();
+            $channel->queue_declare(self::QUEUE_NAME, false, true, false, false);
+
+            $callback = function ($msg) use ($logger) {
+                $data = json_decode($msg->body, true);
+                if ($logger) {
+                    $logger->info("Processing queued webhook for task #" . $data['task_id']);
+                } else {
+                    error_log("Processing queued webhook for task #" . $data['task_id']);
+                }
+                global $wpdb;
+                $table = $wpdb->prefix . 'ai_tasks';
+                $task = $wpdb->get_row($wpdb->prepare("SELECT * FROM {$table} WHERE id = %d", $data['task_id']));
+                if ($task) {
+                    self::send_webhook_notification($task);
+                }
+                $msg->ack();
+            };
+
+            $channel->basic_consume(self::QUEUE_NAME, '', false, false, false, false, $callback);
+
+            while ($channel->is_consuming()) {
+                $channel->wait();
+            }
+
+            $channel->close();
+            $connection->close();
+        } catch (\Exception $e) {
+            if ($logger) {
+                $logger->error("Error processing webhook queue: " . $e->getMessage());
+            } else {
+                error_log("Error processing webhook queue: " . $e->getMessage());
+            }
+        }
+    }
+
+    /**
+     * 验证 Webhook 签名
+     *
+     * 供外部系统在接收到 Webhook 后验证 payload 是否正确
+     *
+     * @param string $payload_str 组合好的 payload 字串
+     * @param string $signature 从请求中取得的签名
+     * @return bool 是否验证通过
+     */
+    public static function verify_webhook_signature($payload_str, $signature) {
+        $expected_sig = hash_hmac('sha256', $payload_str, self::$secret_key);
+        return hash_equals($expected_sig, $signature);
+    }
+}
+
+目錄：/www/wwwroot/xart003.heatgroups.top/wp-content/plugins/ai-content-generator-plugin
+檔名：task_simu.php
+==================================================
+<?php
+/**
+ * Plugin Name: AI Task Simulator
+ * Description: Simulates AI task generation and processing in a distributed system.
+ * Version: 1.0
+ * Author: Your Name
+ * License: GPL2
+ */
+
+// Ensure the plugin is not accessed directly
+if ( ! defined( 'ABSPATH' ) ) {
+    exit; // Exit if accessed directly
+}
+
+// Register REST API routes for the plugin
+function register_ai_task_simulator_routes() {
+    register_rest_route('api/v1', '/tasks/create', array(
+        'methods' => 'POST',
+        'callback' => 'create_task', // Handles task creation
+        'permission_callback' => '__return_true', // No permission check (can be modified later)
+    ));
+}
+add_action('rest_api_init', 'register_ai_task_simulator_routes');
+
+// Handle task creation (POST /wp-json/api/v1/tasks/create)
+function create_task(WP_REST_Request $request) {
+    // Get the task prompt and content type from the request
+    $data = $request->get_json_params();
+    $prompt = sanitize_text_field($data['prompt']); // Sanitize the prompt
+    $content_type = sanitize_text_field($data['content_type']); // Sanitize content type
+
+    // Validate that content_type is provided
+    if (empty($content_type)) {
+        return new WP_REST_Response(array('message' => 'Missing content_type'), 400);
+    }
+
+    // Simulate the task creation - we don't use the database, just return a success response
+    $task_id = rand(1000, 9999);  // Simulating task ID
+    $response_data = array(
+        'task_id' => $task_id,
+        'status' => 'created',
+        'content_type' => $content_type,
+        'prompt' => $prompt
+    );
+
+    return new WP_REST_Response($response_data, 200);
+}
+
+// Register admin menu and page for generating tasks
+function ai_task_simulator_admin_menu() {
+    add_menu_page(
+        'AI Task Simulator', // Page Title
+        'AI Task Simulator', // Menu Title
+        'manage_options', // Capability
+        'ai-task-simulator', // Menu Slug
+        'ai_task_simulator_admin_page', // Callback function
+        'dashicons-admin-tools', // Icon
+        25 // Position in the menu
+    );
+}
+add_action('admin_menu', 'ai_task_simulator_admin_menu');
+
+// Display the admin page content
+function ai_task_simulator_admin_page() {
+    ?>
+    <div class="wrap">
+        <h1>AI Task Simulator</h1>
+        <form method="post" action="">
+            <h3>Generate Random Tasks</h3>
+            <select id="content-type" name="content_type">
+                <option value="image">Image</option>
+                <option value="text">Text</option>
+                <option value="music">Music</option>
+                <option value="video">Video</option>
+            </select>
+            <input type="button" class="button-primary" id="generate-task-btn" value="Generate 10 Tasks with Random Prompt">
+            <div id="response-message" style="margin-top: 20px;"></div>
+            <div id="task-list" style="margin-top: 20px;"></div>
+        </form>
+    </div>
+
+    <script>
+    // JavaScript to handle the button click and AJAX request
+    document.getElementById('generate-task-btn').addEventListener('click', function() {
+        var prompts = [
+            'Generate an image of a futuristic city.',
+            'Generate an image of a space station orbiting a planet.',
+            'Generate a digital painting of a medieval castle.',
+            'Generate an image of a nature scene with mountains and rivers.',
+            'Generate a fantasy forest with glowing trees and magical creatures.'
+        ];
+
+        // Pick a random content type
+        var contentType = document.getElementById('content-type').value;  // Get selected content type
+        var token = 'naGFCXaFjuOPNcN9WawmQZzjM2Ftuw8i'; // Your Bearer token
+
+        // Create an array to store the task results
+        var tasks = [];
+
+        // Generate 10 tasks with random prompts
+        for (var i = 0; i < 10; i++) {
+            var randomPrompt = prompts[Math.floor(Math.random() * prompts.length)];
+
+            // Perform an AJAX request to create a task with the random prompt and content type
+            jQuery.ajax({
+                url: '<?php echo esc_url( rest_url('api/v1/tasks/create') ); ?>',
+                type: 'POST',
+                contentType: 'application/json',
+                headers: {
+                    'Authorization': 'Bearer ' + token  // Include Bearer token in the header
+                },
+                data: JSON.stringify({ 
+                    'prompt': randomPrompt,
+                    'content_type': contentType // Add content_type to the data
+                }),
+                success: function(response) {
+                    tasks.push(response.data);  // Store the task data
+                    if (tasks.length === 10) {
+                        displayTasks(tasks);  // When all tasks are generated, display them
+                    }
+                },
+                error: function(xhr, status, error) {
+                    document.getElementById('response-message').innerHTML = '<p>Error: ' + error + '</p>';
+                }
+            });
+        }
+    });
+
+    // Function to display the tasks in the HTML
+    function displayTasks(tasks) {
+        var taskListHTML = '<ul>';
+        tasks.forEach(function(task) {
+            taskListHTML += '<li>Task ID: ' + task.task_id + ', Status: ' + task.status + ', Content Type: ' + task.content_type + ', Prompt: ' + task.prompt + '</li>';
+        });
+        taskListHTML += '</ul>';
+        document.getElementById('task-list').innerHTML = taskListHTML;
+    }
+    </script>
+    <?php
+}
+
+
+目錄：/www/wwwroot/xart003.heatgroups.top/wp-content/plugins/ai-content-generator-plugin
+檔名：readme.txt
+==================================================
+下面提供详细的 README 文档，涵盖本项目的整体架构、安装部署、配置说明、文件结构、API 接口、数字身份证生成、Webhook 回调、WP Admin 后台管理，以及后续扩展建议。此文档适用于 Ubuntu 22 环境下的 WordPress 6.7.2（PHP 8.1 + MySQL）部署，同时说明如何与 Python 节点进行分布式任务协同。
+
+---
+
+# AI Content Generator Plugin
+
+**多模态分布式 AI 内容生成系统**  
+版本：1.0.1a  
+作者：HarvardWang  
+官网：https://example.com/ai-content-generator
+
+本项目是一个 MVP 级别的分布式 AI 内容生成系统示例工程，旨在通过 WordPress 插件实现多模态任务调度、数字身份证（Digital ID）验证、Webhook 回调、节点注册及管理等核心功能，同时为后续扩展（如 Docker 化、区块链签名、多语言支持、节点负载均衡）预留接口。
+
+---
+
+## 目录
+
+- [项目背景](#项目背景)
+- [系统架构](#系统架构)
+- [主要功能](#主要功能)
+- [环境要求](#环境要求)
+- [安装部署](#安装部署)
+- [配置说明](#配置说明)
+- [文件结构](#文件结构)
+- [API 接口文档](#api-接口文档)
+- [Webhook 回调机制](#webhook-回调机制)
+- [WP Admin 后台界面](#wp-admin-后台界面)
+- [Python 节点集成](#python-节点集成)
+- [安全性及鉴权](#安全性及鉴权)
+- [后续扩展与改进](#后续扩展与改进)
+- [许可协议](#许可协议)
+
+---
+
+## 项目背景
+
+本项目针对企业分布式 AI 内容生成需求，设计了一套支持多种模态（图像、音乐、文字、视频、数字人及印刷任务）的调度系统。系统核心目标包括：
+
+- **多模态内容生成**：通过不同的 `content_type`（如 image、music、text、video、digital_human、printing）区分任务类型。
+- **数字身份证（Digital ID）机制**：为每个生成内容及每台节点生成唯一的数字 ID，通过 SHA-256（结合 secret 与 timestamp）或 UUID 方式生成示例，证明内容来源。
+- **分布式派工**：后端管理 tasks 表，节点通过 `/api/tasks/pull` 接口抢单，利用 SQL 行级锁（`SELECT FOR UPDATE`）确保并发安全；同时支持超时任务自动回收及重试计数。
+- **Webhook 回调**：任务完成或失败后，自动 POST JSON 数据到预设的 webhook_url，数据中包含 result_url、digital_id、timestamp、signature 等信息，并支持失败重试。
+- **印刷机节点**：专门用于处理印刷任务（content_type 为 printing），完成印刷后生成独立的 digital_id 及 PDF/出版链接。
+- **WordPress 插件标准 & 多角色权限管理**：插件包含标准插件头信息、激活/停用钩子（建立或清理数据表、设置 WP Cron）、WP Admin 后台管理界面（仅限管理员操作）及 REST API 接口，所有节点 API 调用均通过 Bearer Token 鉴权。
+
+---
+
+## 系统架构
+
+整体架构由两部分组成：
+
+1. **WordPress 后端（插件）**  
+   - 实现任务与节点管理、API 路由、数字身份证生成、Webhook 回调及管理后台界面。
+   - 数据库中包含两个主要表：`ai_tasks` 与 `ai_nodes`，分别存储任务信息和节点信息。
+
+2. **Python 节点**  
+   - 独立的 Python 3.8+ 节点（例如 node_agent.py），负责执行 AI 生成任务（图像、音乐、文字、视频、数字人、印刷）。
+   - 通过 REST API 接口与后端进行任务拉取、完成状态上报、心跳检测以及数字身份证生成。
+   - （本项目示例主要集中在 WordPress 插件部分，Python 节点可作为独立组件实现。）
+
+架构图示例（示意图）：
+
+```
+  +-----------------------+
+  | WordPress 后端系统    |
+  |  - 任务调度、API      |
+  |  - 数据库（ai_tasks,  |
+  |    ai_nodes）         |
+  |  - Webhook 回调       |
+  +----------+------------+
+             |
+             | HTTPS + Bearer Token 鉴权
+             |
+  +----------v-----------+
+  | 分布式 AI 节点       | <--- 包括普通节点 & 印刷机节点
+  | (Python 节点 Agent)  |
+  +----------------------+
+```
+
+---
+
+## 主要功能
+
+- **任务管理**  
+  - 创建、更新、删除 AI 生成任务。
+  - 多模态任务支持：通过 `content_type` 区分图像、文字、印刷等任务。
+  - 分布式派工：使用 SQL 事务与行级锁确保任务抢单安全。
+  - 定时任务检测：通过 WP Cron 定期处理超时任务，并将超时任务标记为失败且重试。
+
+- **节点管理**  
+  - 节点注册：通过 REST API 自动生成节点认证 Token（auth_token）。
+  - 心跳更新：节点调用 API 更新存活状态。
+  - 后台管理：在 WP Admin 后台查看、搜索、分页管理已注册节点。
+
+- **数字身份证 & 签名**  
+  - 每个任务返回一个 `digital_id`（示例为 `task_任务ID_UUID`），并在 Webhook 回调中利用 HMAC-SHA256 生成签名。
+
+- **Webhook 回调**  
+  - 任务完成/失败后自动 POST 回调，发送 JSON 数据（包括 digital_id、result_url、status、timestamp、signature）。
+  - 失败时记录日志并可推送至外部消息队列（RabbitMQ 示例代码）。
+
+- **REST API 接口**  
+  - 提供节点注册、任务创建、任务拉取、任务完成、任务查询、节点查询等接口，均通过 Bearer Token 鉴权。
+
+- **WP Admin 后台 UI**  
+  - 采用 Bootstrap 4 实现响应式设计，包含任务管理与节点管理页面，支持筛选、分页和关键字搜索。
+
+---
+
+## 环境要求
+
+- **操作系统**：Ubuntu 22 (使用宝塔管理面板)
+- **Web 服务器**：Apache 或 Nginx
+- **WordPress**：6.7.2
+- **PHP**：8.1
+- **数据库**：MySQL/MariaDB
+- **Python 节点**：Python 3.8+（独立部署）
+- **HTTPS 证书**：支持自签名或正式证书部署
+
+---
+
+## 安装部署
+
+1. **下载插件**  
+   将插件目录 `ai-content-generator-plugin` 上传至 WordPress 的 `/wp-content/plugins/` 目录中。
+
+2. **插件激活**  
+   在 WordPress 后台，进入“插件”页面，找到 “AI Content Generator” 并点击激活。  
+   激活时将自动执行以下操作：
+   - 调用 `register_activation_hook` 创建数据库表（ai_tasks 与 ai_nodes）。
+   - 设置 WP Cron 排程（每 15 分钟检测任务状态与节点心跳）。
+
+3. **配置 HTTPS 与服务器**  
+   确保 Web 服务器已配置好 HTTPS，所有 API 接口及 Webhook 回调 URL 均使用 HTTPS 协议。
+
+4. **Python 节点部署（可选）**  
+   如需使用 Python 节点执行 AI 任务，需独立开发并部署 node_agent.py：
+   - 根据 `config.json` 指定 `node_type`（例如 image_node、printing_node）。
+   - 定时调用 `/api/v1/tasks/pull` 接口抢单，完成任务后调用 `/api/v1/tasks/complete` 报告结果。
+   - 配置心跳检测功能，确保节点状态及时更新至后端。
+
+---
+
+## 配置说明
+
+- **WP Cron 配置**  
+  插件通过 `add_filter('cron_schedules')` 添加了 15 分钟间隔的 Cron 任务，用于调用 `handle_scheduled_tasks()` 及节点清理函数。
+
+- **Webhook 配置**  
+  在创建任务时可通过 API 参数 `webhook_url` 指定回调地址。Webhook 回调将使用预设的 secret key（例如 `my-production-webhook-secret`，建议在生产环境中从安全设置中加载）生成签名，并以 JSON 格式 POST 数据。
+
+- **Token 鉴权**  
+  所有 API 调用要求在 HTTP Header 中添加 `Authorization: Bearer <TOKEN>`，其中 TOKEN 为在节点注册时生成的 `auth_token`。部分接口允许通过请求参数 `secret_key`（示例中为 `ABC123`）进行验证，适用于第三方系统创建任务。
+
+---
+
+## 文件结构
+
+```
+ai-content-generator-plugin/
+├── ai-content-generator.php          // 插件主文件，包含激活/停用钩子、菜单注册、API 初始化
+├── convert_text_to_files.php         // 辅助脚本，用于解析文本生成文件（示例工具）
+├── admin/
+│   ├── admin-main-page.php           // 后台主页面
+│   ├── admin-tasks-page.php          // 任务管理页面（WP Admin）
+│   └── admin-nodes-page.php          // 节点管理页面（WP Admin）
+├── templates/                        // 前端/后台视图模板
+│   ├── admin-tasks-page.php
+│   └── admin-nodes-page.php
+└── includes/                         
+    ├── class-api-controller.php      // REST API 控制器，定义所有 API 路由与鉴权
+    ├── class-task-manager.php        // 任务管理类：创建任务、抢单、更新状态、定时处理超时任务
+    ├── class-node-manager.php        // 节点管理类：注册节点、心跳更新、查询与删除
+    └── class-webhook-handler.php     // Webhook 回调处理类：生成签名、发送 POST 请求、记录重试信息
+```
+
+---
+
+## API 接口文档
+
+所有 API 接口均基于 REST，前缀为 `/wp-json/api/v1/`。下面列出主要接口及示例：
+
+### 节点相关
+
+- **注册节点**  
+  - **URL**: `POST /wp-json/api/v1/nodes/register`  
+  - **参数**:
+    - `node_type` (必填): 节点类型（如 `image_node`、`printing_node` 等）
+  - **响应示例**:
+    ```json
+    {
+      "node_id": 123,
+      "auth_token": "随机生成的Token",
+      "registered_at": "2025-03-21 10:00:00"
+    }
+    ```
+
+- **获取节点列表**  
+  - **URL**: `GET /wp-json/api/v1/nodes`  
+  - **要求**：必须通过 Bearer Token 验证  
+  - **响应**: 返回节点对象数组
+
+- **获取单个节点信息**  
+  - **URL**: `GET /wp-json/api/v1/nodes/<id>`
+
+- **删除节点**  
+  - **URL**: `DELETE /wp-json/api/v1/nodes/<id>`  
+  - **验证**：支持通过 `secret_key` 或 Token 鉴权
+
+### 任务相关
+
+- **创建任务**  
+  - **URL**: `POST /wp-json/api/v1/tasks/create`  
+  - **参数**:
+    - `content_type` (必填): 任务类型（如 `image`, `text`, `printing` 等）
+    - `content_payload` (选填): 任务参数（JSON 格式字符串）
+    - `webhook_url` (选填): 回调地址
+  - **响应示例**:
+    ```json
+    {
+      "task_id": 456,
+      "status": "pending",
+      "content_type": "image",
+      "content_payload": "{...}",
+      "webhook_url": "https://example.com/webhook",
+      "created_at": "2025-03-21 10:05:00"
+    }
+    ```
+
+- **任务列表查询**  
+  - **URL**: `GET /wp-json/api/v1/tasks`  
+  - **参数**：支持 `status`, `limit`, `offset` 参数进行筛选和分页
+
+- **任务抢单（节点拉取任务）**  
+  - **URL**: `POST /wp-json/api/v1/tasks/pull`  
+  - **参数**：
+    - 节点必须通过 Token 鉴权，接口返回的任务中附有 `digital_id` 字段  
+  - **响应示例**:
+    ```json
+    {
+      "task_id": 456,
+      "content_type": "image",
+      "content_payload": "{...}",
+      "webhook_url": "https://example.com/webhook",
+      "digital_id": "task_456_550e8400-e29b-41d4-a716-446655440000",
+      "status": "in_progress"
+    }
+    ```
+
+- **任务完成上报**  
+  - **URL**: `POST /wp-json/api/v1/tasks/complete`  
+  - **参数**：
+    - `task_id`: 任务 ID
+    - `status`: 完成状态（例如 `completed` 或 `failed`）
+    - `result_url`: 生成内容或印刷结果 URL
+    - `error_message` (选填): 若任务失败，附加错误说明
+  - **响应示例**:
+    ```json
+    {
+      "success": true,
+      "message": "Task result recorded",
+      "task": {
+         "id": 456,
+         "status": "completed",
+         "result_url": "https://example.com/result/456.pdf"
+      }
+    }
+    ```
+
+- **删除任务**  
+  - **URL**: `DELETE /wp-json/api/v1/tasks/<id>`
+
+---
+
+## Webhook 回调机制
+
+- **触发条件**：  
+  当任务状态更新为非 `in_progress`（即任务完成或失败）且任务记录中包含 `webhook_url` 时，系统自动调用 Webhook。
+
+- **回调内容**：  
+  Webhook 发送 JSON 数据，内容示例如下：
+  ```json
+  {
+    "digital_id": "task_456_550e8400-e29b-41d4-a716-446655440000",
+    "result_url": "https://example.com/result/456.pdf",
+    "status": "completed",
+    "signature": "基于HMAC-SHA256生成的签名",
+    "timestamp": "2025-03-21 10:10:00"
+  }
+  ```
+  签名生成方法：使用预设的 secret key 与 `digital_id|result_url|status` 字符串生成 HMAC-SHA256 签名。
+
+- **错误处理**：  
+  若 POST 请求失败，则日志记录错误（支持 Monolog），并将错误信息推送至 RabbitMQ 队列以供后续重试。
+
+---
+
+## WP Admin 后台界面
+
+- **管理菜单**  
+  在 WordPress 后台侧边栏中添加 “AI Content” 主菜单，下设 “Tasks” 与 “Nodes” 子菜单。
+  
+- **任务管理页面**  
+  - 显示任务列表，支持根据状态（pending、in_progress、completed、failed）筛选、关键字搜索及分页导航。
+  - 管理员可编辑或删除任务记录。
+
+- **节点管理页面**  
+  - 显示所有注册节点信息（节点 ID、节点类型、auth_token、最后心跳时间、注册时间）。
+  - 支持模糊搜索与分页管理，确保管理员能实时监控节点状态。
+
+---
+
+## Python 节点集成
+
+虽然本插件主要实现了后端 API 和任务管理功能，但完整系统中还需要部署 Python 节点，主要功能包括：
+
+- **配置**  
+  - 通过 `config.json` 指定 `node_type`（例如 `image_node`、`printing_node` 等）。
+  
+- **任务拉取与处理**  
+  - 定期调用 `/api/v1/tasks/pull` 接口，获取待处理任务。  
+  - 根据任务的 `content_type` 分发至相应的生成算法（例如调用 Stable Diffusion、OpenAI API、Dummy 生成函数等）。
+  - 生成内容后，通过 `/api/v1/tasks/complete` 上报任务结果及生成的数字身份证（digital_id）。
+
+- **心跳检测**  
+  - 定时调用 API 更新自身状态，确保后端能监控节点在线情况。
+
+开发者可根据实际需要，参考插件中的 API 定义，自行实现独立的 Python 节点代理程序。
+
+---
+
+## 安全性及鉴权
+
+- **HTTPS**  
+  所有 API 请求和 Webhook 回调均建议通过 HTTPS 进行，以确保数据传输安全。
+
+- **Bearer Token 鉴权**  
+  - 所有受保护的 API 接口必须在 HTTP Header 中携带 `Authorization: Bearer <TOKEN>`。
+  - 后端通过 `check_auth()` 方法校验 Token，确保只有已注册节点或授权系统能访问 API。
+
+- **自定义验证**  
+  - 部分接口支持通过预设 `secret_key` 参数进行验证（例如 `ABC123`），适用于第三方系统直接创建任务。
+
+---
+
+## 后续扩展与改进
+
+- **区块链或 PKI 数字身份证验证**  
+  - 当前仅采用简单的 UUID 与 HMAC 签名生成数字身份证，后续可扩展为区块链式身份验证或 PKI 机制。
+
+- **Docker 化部署**  
+  - 可将后端和 Python 节点均 Docker 化，便于多环境部署与扩展。
+
+- **多语言支持**  
+  - 进一步完善插件的国际化，支持多语言翻译。
+
+- **消息队列集成**  
+  - 目前 Webhook 重试依赖 RabbitMQ 示例代码，后续可整合 Kafka 或其他消息队列以提升分布式处理能力。
+
+- **节点负载均衡**  
+  - 结合负载均衡方案，实现节点自动扩容与动态调度。
+
+---
+
+## 许可协议
+
+本项目示例代码采用 MIT 许可证。欢迎在遵循许可证条款的前提下使用、修改和分发此代码。
+
+---
+
+## 联系与支持
+
+如有问题或建议，请联系 [HarvardWang](https://example.com) 或提交 Issue 至项目仓库。
+
+---
+
+以上即为本项目的详细 README 文档。通过本文档，开发者可以快速理解系统架构、部署方法、API 调用及后续扩展方向，为分布式 AI 内容生成系统的落地提供基础支持。
+
+=== AI Content Generator ===
+Contributors: YourName
+Tags: AI, content generation, distributed, WordPress, plugin, multi-modal, webhook, task scheduling, logging, queue
+Requires at least: 5.0
+Tested up to: 6.2
+Requires PHP: 7.4
+Stable tag: 1.0
+License: GPLv2 or later
+License URI: https://www.gnu.org/licenses/gpl-2.0.html
+
+== Description ==
+
+AI Content Generator is a production-ready, distributed AI content generation system built for WordPress.
+It supports multi-modal content generation including text, images, music, video, digital human, and printing.
+The plugin provides a robust task distribution mechanism via REST API endpoints, secure digital ID generation,
+and advanced webhook callbacks with HMAC-SHA256 signature verification.
+
+Key features include:
+- Distributed task scheduling and assignment.
+- Secure REST API endpoints with Bearer Token authentication.
+- Webhook callback system with HMAC-SHA256 signature verification.
+- Robust retry mechanism for webhook failures integrated with external queue (RabbitMQ).
+- Advanced logging using Monolog for detailed diagnostics and monitoring.
+- Responsive and intuitive admin UI built with Bootstrap for managing tasks and nodes.
+- Extensible architecture to support future enhancements (e.g., Dockerization, blockchain identity verification, multi-language support).
+
+== Installation ==
+
+1. Upload the entire `ai-content-generator-plugin` folder to the `/wp-content/plugins/` directory.
+2. Activate the plugin via the 'Plugins' menu in WordPress.
+3. Ensure that your database user has sufficient permissions to create and modify tables. Upon activation,
+   the plugin will create the required tables (e.g., `wp_ai_tasks` and `wp_ai_nodes`).
+4. Configure external services as needed:
+   - For advanced webhook retry mechanism, set up RabbitMQ and adjust the connection parameters in the plugin code.
+   - For advanced logging, install Monolog via Composer. The plugin will use Monolog if available.
+5. (Optional) Customize settings such as the webhook secret key or external queue parameters either directly
+   in the code (in class-webhook-handler.php) or via extending the plugin with a settings page.
+
+== Usage ==
+
+After activation, a new menu titled "AI Content" will appear in the WordPress admin sidebar.
+This menu provides access to two main management pages:
+- **Tasks**: Manage and monitor AI generation tasks. You can filter tasks by status, search by keyword,
+  and navigate through pages of task records.
+- **Nodes**: View and manage registered AI nodes, check their status (including heartbeat monitoring), and perform basic operations.
+
+The plugin also exposes a set of REST API endpoints under `/wp-json/api/v1/` for integration with external systems and AI nodes:
+- `/nodes/register` – Register a new node.
+- `/tasks/create` – Create a new AI generation task.
+- `/tasks/pull` – Nodes pull pending tasks.
+- `/tasks/complete` – Nodes report task completion or failure.
+- Additional endpoints for listing, retrieving, or deleting tasks and nodes are also available.
+
+== Changelog ==
+
+= 1.0 =
+* Initial release with full multi-modal distributed AI content generation system.
+* Includes distributed task scheduling, node registration, secure REST API endpoints, advanced webhook callbacks with distributed retry mechanism, and an intuitive admin UI built with Bootstrap.
+* Integrated external queue support (RabbitMQ) and advanced logging (Monolog) for production-grade reliability.
+
+== Upgrade Notice ==
+
+= 1.0 =
+Initial release.
+
+== Frequently Asked Questions ==
+
+= How do I configure the external queue (RabbitMQ)? =
+The plugin's external queue settings are defined in `class-webhook-handler.php` using constants (e.g., QUEUE_HOST, QUEUE_PORT, QUEUE_USER, QUEUE_PASSWORD, QUEUE_NAME). Modify these constants to suit your environment, or extend the plugin with a settings page for easier configuration.
+
+= What if I do not have Monolog or PhpAmqpLib installed? =
+For production environments, it is recommended to install these libraries via Composer to enable advanced logging and distributed retry features. The plugin will fallback to basic error logging if these libraries are unavailable, but advanced features may be limited.
+
+= Can I extend the plugin with additional features? =
+Yes. The plugin is designed with extensibility in mind. You can extend it with additional REST API endpoints, improve the admin UI, add settings pages, integrate with additional external services (e.g., Docker, blockchain), and more.
+
+== License ==
+
+This plugin is licensed under the GPLv2 or later. See the License URI above for more details.
+
+

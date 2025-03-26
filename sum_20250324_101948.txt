@@ -1,0 +1,5427 @@
+目錄：/hermes/bosnacweb08/bosnacweb08ar/b174/ipg.sweetekconnie46425/line/lineapi/php
+檔名：webhook.php
+==================================================
+<?php
+// webhook.php
+
+require_once 'config.php';
+require_once 'database.php';
+require_once 'line_functions.php';
+require_once 'qr_code_functions.php';
+require_once 'gpt_functions.php';
+require_once 'utility.php';
+
+// 取得 POST 請求內容
+$input = file_get_contents('php://input');
+logme("Received input: " . $input);
+$events = json_decode($input, true);
+
+if (json_last_error() !== JSON_ERROR_NONE) {
+    logme("Failed to decode input JSON: " . json_last_error_msg());
+    exit;
+}
+
+if (!empty($events['events'])) {
+    foreach ($events['events'] as $event) {
+        $replyToken = $event['replyToken'];
+        $user_id = $event['source']['userId'];
+        $message_type = $event['message']['type'];
+
+        logme("Processing event for user: $user_id");
+
+        $messages = []; // 用於存儲要回復的消息
+
+        if ($message_type == 'image') {
+            $message_id = $event['message']['id'];
+            logme("Received image message with ID: $message_id");
+
+            $image_path = downloadImage($message_id);
+
+            if ($image_path) {
+                logme("Image downloaded successfully: $image_path");
+
+                $conn = getDatabaseConnection();
+
+                $profile = getUserProfile($user_id);
+                $line_user_name = $profile['displayName'];
+
+                updateUserName($conn, $user_id, $line_user_name);
+
+                if (isNewUser($conn, $user_id)) {
+                    // 新用戶處理
+                    logme("User $user_id is a new user.");
+
+                    $qr_code_path = saveQRCode($user_id);
+                    $modified_image_path = attachQRCodeToImage($image_path, $qr_code_path);
+
+                    $qr_content = "HWAIS-" . $user_id;
+
+                    if (saveNewUserData($conn, $user_id, $line_user_name, $qr_content)) {
+                        // 構建回復消息
+                        $message_text = "$line_user_name 歡迎您使用 AI Magic，已經為您註冊成功！\n\n";
+                        $message_text .= "您每天可免費使用兩次服務。\n\n";
+                        $message_text .= "您上傳的圖片已加上專屬 QR 碼，請您下載圖片，再分享至本頻道，即可由 AI Magic 生成精彩作品。\n\n";
+                        $message_text .= "生成作品需要計算資源，可能需要等待 5-10 分鐘，在等待新作品生成時，您可以到本頻道專屬網站欣賞其他作品。\n\n";
+                        $message_text .= "頻道專屬網站: $store_url\n\n";
+                        $message_text .= "請您持續關心並推廣本頻道，如有任何意見，歡迎留言 - AI 藝術推廣";
+
+                        $messages[] = [
+                            'type' => 'text',
+                            'text' => $message_text
+                        ];
+
+                        // 添加帶有 QR Code 的圖片
+                        $modified_image_url = $line_image_url_base . $modified_image_path;
+                        $messages[] = [
+                            'type' => 'image',
+                            'originalContentUrl' => $modified_image_url,
+                            'previewImageUrl' => $modified_image_url
+                        ];
+
+                        logme("New user registered and reply message prepared for user: $user_id");
+                    } else {
+                        $message_text = "$line_user_name 註冊失敗，請聯繫管理員，並告知您的用戶 ID：$user_id";
+                        $messages[] = [
+                            'type' => 'text',
+                            'text' => $message_text
+                        ];
+                        logme("New user registration failed for user: $user_id");
+                    }
+                } else {
+                    // 老用戶處理
+                    logme("User $user_id is an existing user.");
+
+                    $qr_content = decodeQRCodeUsingAPI($image_path);
+
+                    if ($qr_content == '無法讀取二維碼') {
+                        // 未檢測到有效的 QR 碼，系統自動添加
+                        logme("No valid QR Code detected for user: $user_id. Automatically adding QR Code.");
+                        $qr_code_path = saveQRCode($user_id);
+                        $modified_image_path = attachQRCodeToImage($image_path, $qr_code_path);
+                        $image_path = $modified_image_path; // 更新圖片路徑
+
+                        // 更新 qr_content
+                        $qr_content = "HWAIS-" . $user_id;
+                    }
+
+                    logme("Final QR content: $qr_content");
+
+                    // 此時，圖片應該包含用戶的 QR 碼
+                    if (isValidQRCode($conn, $qr_content, $user_id)) {
+                        $quota = hasQuota($conn, $user_id);
+                        if ($quota > 0) {
+                            // 調用 GPT-4
+                            $result = askGPT($user_id, $image_path, $qr_content);
+									
+							if ($result) {
+								$extracted_data  = $result['extracted_data'];
+								$extracted_data2 = $result['extracted_data2'];
+								$event_code = $result['event_code'];
+								$record_id = $result['record_id'];
+							}	
+                            if ($extracted_data) {
+                                deductQuota($conn, $user_id);
+                                $quota = hasQuota($conn, $user_id);
+                                logme("Quota after deduction: $quota");
+
+                                // 構建回復消息
+                                $creative_title = $extracted_data['專欄標題'];
+                                $picture_analysis = $extracted_data['圖片分析'];
+                                $creative_inspiration = $extracted_data['創作靈感'];
+
+                                $message_text = "\u{2764} $line_user_name \u{2764} 您好，AI Magic 完成分析如下:\n\n";
+                                $message_text .= "\u{2B50}專欄標題: $creative_title\n\n";
+                                $message_text .= "\u{1F4DD}圖片分析:\n$picture_analysis\n\n";
+                                $message_text .= "\u{1F4A1}創作靈感:\n$creative_inspiration\n\n";
+                               // $message_text .= "\u{1F514}大約5分鐘後，您可以到 $store_url 查看AI為您生成的作品\n\n";
+$message_text .= "\u{1F514}大約5分鐘後，您可以到 " . $line_image_url_base . "findpost_new.php?user_id=" . $user_id . " 查看AI為您生成的作品\n\n";
+
+                                $message_text .= "\u{1F6A8}您剩餘額度: $quota\n";
+                                $message_text .= "\u{1F6A8}event_code: $event_code\n";
+                                $message_text .= "\u{1F6A8}record_id: $record_id\n";			
+								
+                                logme("Constructed reply message: $message_text");
+
+                                $messages[] = [
+                                    'type' => 'text',
+                                    'text' => $message_text
+                                ];
+
+                                logme("GPT response sent to user: $user_id");
+                            } else {
+                                $message_text = "抱歉，無法獲取 GPT 的回應，請稍後再試。";
+                                $messages[] = [
+                                    'type' => 'text',
+                                    'text' => $message_text
+                                ];
+                                logme("Failed to get GPT response for user: $user_id");
+                            }
+                        } else {
+                            $message_text = "$line_user_name，您的額度已用完，請明天再試或聯繫管理員。";
+                            $messages[] = [
+                                'type' => 'text',
+                                'text' => $message_text
+                            ];
+                            logme("User quota exhausted for user: $user_id");
+                        }
+                    } else {
+                        $message_text = "$line_user_name，您的 QR 碼無效，請聯繫管理員。";
+                        $messages[] = [
+                            'type' => 'text',
+                            'text' => $message_text
+                        ];
+                        logme("Invalid QR Code for user: $user_id");
+                    }
+                }
+
+                $conn->close();
+            } else {
+                $message_text = "抱歉，無法下載您的圖片。";
+                $messages[] = [
+                    'type' => 'text',
+                    'text' => $message_text
+                ];
+                logme("Failed to download image for user: $user_id");
+            }
+        } else {
+            $message_text = "抱歉，目前僅支持圖片消息。";
+            $messages[] = [
+                'type' => 'text',
+                'text' => $message_text
+            ];
+            logme("Unsupported message type from user: $user_id");
+        }
+
+        // 最後回復用戶，確保只回復一次
+        if (!empty($messages)) {
+            replyMessage($replyToken, $messages);
+        }
+    }
+} else {
+    logme("No events found in the input.");
+}
+?>
+
+
+目錄：/hermes/bosnacweb08/bosnacweb08ar/b174/ipg.sweetekconnie46425/line/lineapi/php
+檔名：reply.php
+==================================================
+<?php
+// Example usage:
+logme("This is a begin message");
+logme("Another log entry");
+// Replace with your actual LINE access token
+$access_token = "E551NpPT8+aG9ujdrAJ/HqvnOglmWhHMFnzEYxNIkoBiZOGLG4GE/73ktgPeDILOLJAsAlNLbUlKYld+6l+RoiNKPMSboWWpdHyHpqjoKkSLu0PV2As+Owi1680aR0aoTsiY1IyKiLHYXABU1hzALQdB04t89/1O/w1cDnyilFU=";
+
+$userId = 'Uc90673ef3d0404550c6b5538a24f93d7'; // The LINE user ID
+$wordpress_post_ids = 1910;
+$message = "已經為您生成的一個post, 您可以到此連結觀看成果 = https://lasova.heatgroups.com/?p=" . $wordpress_post_ids;
+
+pushMessage($userId, $message);
+
+function pushMessage($userId, $message) {
+    global $access_token;
+
+    $url = 'https://api.line.me/v2/bot/message/push';
+    $data = [
+        'to' => $userId,
+        'messages' => [
+            [
+                'type' => 'text',
+                'text' => $message
+            ]
+        ]
+    ];
+
+    $post = json_encode($data);
+    $headers = [
+        'Content-Type: application/json',
+        'Authorization: Bearer ' . $access_token
+    ];
+
+    $ch = curl_init($url);
+    curl_setopt($ch, CURLOPT_POST, true);
+    curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    curl_setopt($ch, CURLOPT_POSTFIELDS, $post);
+
+    $response = curl_exec($ch);
+
+    if (curl_errno($ch)) {
+        echo 'Curl error: ' . curl_error($ch);
+    } else {
+        echo 'Response: ' . $response;
+    }
+
+    curl_close($ch);
+}
+
+function logme($text) {
+    // Define the path to the log file
+    $log_file = 'msg.log';
+    
+    // Prepare the message with a timestamp
+    $message = $text . " written to msg.log on " . date("Y-m-d H:i:s") . "\n";
+    
+    // Write the message to the log file
+    error_log($message, 3, $log_file);
+}
+
+
+?>
+
+
+目錄：/hermes/bosnacweb08/bosnacweb08ar/b174/ipg.sweetekconnie46425/line/lineapi/php
+檔名：path_to_php_script.php
+==================================================
+<?php
+// Database connection
+$read_var=read_config_var();
+global $db_host,$db_user,$db_password,$db_name;
+
+//$db_host = 'sweetekconnie46425.ipagemysql.com';
+//$db_user = 'ericwang';
+//$db_password = 'Eric010101)!)!)!';
+//$db_name = 'sweetekconnie46_fvdg_qscsxdpmlak';
+
+$conn = new mysqli($db_host, $db_user, $db_password, $db_name);
+
+// Check for connection errors
+if ($conn->connect_error) {
+    die("Connection failed: " . $conn->connect_error);
+}
+
+// Get the machine_uuid from input (only required for download)
+$machine_uuid = $_GET['machine_uuid'] ?? null;
+$action = $_GET['action'] ?? null;
+$gpt_responses_id = $_GET['gpt_responses_id'] ?? null;
+$gpt_responses_status = $_GET['gpt_responses_status'] ?? null;
+
+// Actions
+if ($action == 'download') {
+    if (!$machine_uuid) {
+        die("No machine_uuid provided");
+    }
+
+    // SQL query to get the 10 most recent 'pending' tasks for the given machine_uuid
+    $sql = "SELECT gr.id, gr.user_id, gr.gpt_prompt_json, gr.image_url, gr.gpt_question, gr.gpt_ans, ud.user_name 
+            FROM gpt_responses gr
+            JOIN user_data ud ON gr.user_id = ud.user_id
+            WHERE gr.task_machine_uuid = ? AND gr.task_status = 'pending' 
+            ORDER BY gr.q_date ASC 
+            LIMIT 1";
+    
+    // Set character set to utf8mb4 to support Chinese characters
+    $conn->set_charset("utf8mb4");
+
+    $stmt = $conn->prepare($sql);
+    $stmt->bind_param("s", $machine_uuid);
+    $stmt->execute();
+    $result = $stmt->get_result();
+    
+    // Prepare the output
+    $output = [];
+    while ($row = $result->fetch_assoc()) {
+        $gpt_prompt_json = mb_convert_encoding($row['gpt_prompt_json'], 'UTF-8', 'auto');
+        $json_data = json_decode($gpt_prompt_json, true);
+        if (json_last_error() === JSON_ERROR_NONE) {
+            $output[] = [
+                'id' => $row['id'],
+                'user_id' => $row['user_id'],
+                'category' => $json_data['category'],
+                'artist' => $json_data['artist'],
+                'style' => $json_data['style'],
+                'prompt' => $json_data['prompt'],
+                'user_name' => $row['user_name'], // Add user_name from user_data to the output
+                'image_url' => $row['image_url'],
+                'gpt_question' => $row['gpt_question'],
+                'gpt_ans' => $row['gpt_ans']
+            ];
+        } else {
+            echo "Error decoding JSON for id: " . $row['id'] . "\n";
+        }
+    }
+
+    // Check if there are results
+    if (count($output) > 0) {
+        header('Content-Type: application/json');
+        echo json_encode($output, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE);
+    } else {
+        echo "No pending tasks found or invalid JSON format.";
+    }
+
+    // Close the connection
+    $stmt->close();
+}
+
+if ($action == 'update') {
+    if (!$gpt_responses_id || !$gpt_responses_status) {
+        die("Missing gpt_responses_id or gpt_responses_status for update.");
+    }
+
+    // SQL query to update the status based on the id
+    $sql = "UPDATE gpt_responses SET task_status = ? WHERE id = ?";
+    $stmt = $conn->prepare($sql);
+    $stmt->bind_param("si", $gpt_responses_status, $gpt_responses_id);
+    if ($stmt->execute()) {
+        echo "Task with id $gpt_responses_id updated successfully.\n";
+    } else {
+        echo "Failed to update task with id $gpt_responses_id.\n";
+    }
+
+    $stmt->close();
+}
+
+if ($action == 'delete') {
+    if (!$gpt_responses_id) {
+        die("Missing gpt_responses_id for delete.");
+    }
+
+    // SQL query to delete the task based on the id
+    $sql = "DELETE FROM gpt_responses WHERE id = ?";
+    $stmt = $conn->prepare($sql);
+    $stmt->bind_param("i", $gpt_responses_id);
+    if ($stmt->execute()) {
+        echo "Task with id $gpt_responses_id deleted successfully.\n";
+    } else {
+        echo "Failed to delete task with id $gpt_responses_id.\n";
+    }
+
+    $stmt->close();
+}
+
+// Close the connection
+$conn->close();
+
+// Function to load configuration from setup.ini
+function loadConfig($ini_file = 'setup.ini') {
+    if (!file_exists($ini_file)) {
+        die("Configuration file not found: $ini_file");
+    }
+    return parse_ini_file($ini_file, true);
+}
+function read_config_var(){
+
+	$config = loadConfig(); // Load configuration from setup.ini
+    global $line_access_token, $openai_api_key, $db_host, $db_user, $db_password, $db_name;
+    global $qr_code_url, $line_image_url_base, $store_url, $default_prompt;
+	// Replace with your actual LINE access token
+	$line_access_token = $config['API_KEYS']['line_access_token'];
+	$openai_api_key = $config['API_KEYS']['openai_api_key'];
+	// Database connection
+	$db_host = $config['DATABASE']['db_host'];
+	$db_user = $config['DATABASE']['db_user'];
+	$db_password = $config['DATABASE']['db_password'];
+	$db_name = $config['DATABASE']['db_name'];
+	// Generate QR code URL and save image
+	$qr_code_url = $config['URLS']['qr_code_url'];
+	$line_image_url_base = $config['URLS']['line_image_url_base'];
+	$store_url = $config['URLS']['store_url'];
+	$default_prompt =  $config['USER_PROMPTS']['default_prompt'];
+	return "varset";
+}
+?>
+
+
+目錄：/hermes/bosnacweb08/bosnacweb08ar/b174/ipg.sweetekconnie46425/line/lineapi/php
+檔名：report_status.php
+==================================================
+<?php
+$read_var=read_config_var();
+global $db_host,$db_user,$db_password,$db_name;
+
+//$db_host = 'sweetekconnie46425.ipagemysql.com';
+//$db_user = 'ericwang';
+//$db_password = 'Eric010101)!)!)!';
+//$db_name = 'sweetekconnie46_fvdg_qscsxdpmlak';
+
+// Create connection
+$conn = new mysqli($db_host, $db_user , $db_password , $db_name );
+
+// Check connection
+if ($conn->connect_error) {
+    die("Connection failed: " . $conn->connect_error);
+}
+// Set the MySQL time zone to Asia/Taipei
+$timezone_query = "SET time_zone = 'Asia/Taipei'";
+if ($conn->query($timezone_query) === TRUE) {
+    echo "Time zone set to Asia/Taipei successfully.<br>";
+} else {
+    echo "Error setting time zone: " . $conn->error;
+}
+
+// Retrieve data from POST request
+$data = json_decode(file_get_contents('php://input'), true);
+
+$machine_id = $data['machine_id'];
+$status = $data['status'];
+$timestamp = $data['timestamp'];
+
+// update data table machine_status 
+$sql = "INSERT INTO machine_status (machine_id, status, timestamp)
+        VALUES ('$machine_id', '$status', '$timestamp')
+        ON DUPLICATE KEY UPDATE 
+        status = VALUES(status), 
+        timestamp = VALUES(timestamp)";
+
+if ($conn->query($sql) === TRUE) {
+    echo json_encode(["message" => "Status recorded successfully"]);
+} else {
+    echo json_encode(["error" => "Error: " . $sql . "<br>" . $conn->error]);
+}
+
+// Delete records older than 20  minutes from machine_status_log
+
+$timezone_query = "SET time_zone = 'Asia/Taipei'";
+if ($conn->query($timezone_query) === TRUE) {
+    echo "Time zone set to Asia/Taipei successfully.<br>";
+} else {
+    echo "Error setting time zone: " . $conn->error;
+}
+
+$delete_sql = "DELETE FROM `machine_status_log` WHERE `timestamp` < 'NOW() - INTERVAL 20 MINUTE'";
+$delete_sql = "DELETE FROM machine_status_log WHERE timestamp < NOW() - INTERVAL 1 MINUTE";
+$delete_sql = "
+    DELETE FROM machine_status_log 
+    WHERE id NOT IN (
+        SELECT id 
+        FROM (
+            SELECT id 
+            FROM machine_status_log 
+            ORDER BY timestamp DESC 
+            LIMIT 200
+        ) AS last_200
+    )";
+if ($conn->query($delete_sql) === TRUE) {
+    echo json_encode(["message" => "Old records deleted successfully"]);
+} else {
+    echo json_encode(["error" => "Error deleting old records: " . $delete_sql . "<br>" . $conn->error]);
+}
+
+
+// Insert data into table machine_status_log
+$sql = "INSERT INTO machine_status_log (machine_id, status, timestamp) VALUES ('$machine_id', '$status', '$timestamp')";
+
+if ($conn->query($sql) === TRUE) {
+    echo json_encode(["message" => "Status recorded successfully"]);
+} else {
+    echo json_encode(["error" => "Error: " . $sql . "<br>" . $conn->error]);
+}
+$conn->close();
+
+// Function to load configuration from setup.ini
+function loadConfig($ini_file = 'setup.ini') {
+    if (!file_exists($ini_file)) {
+        die("Configuration file not found: $ini_file");
+    }
+    return parse_ini_file($ini_file, true);
+}
+function read_config_var(){
+
+	$config = loadConfig(); // Load configuration from setup.ini
+    global $line_access_token, $openai_api_key, $db_host, $db_user, $db_password, $db_name;
+    global $qr_code_url, $line_image_url_base, $store_url, $default_prompt;
+	// Replace with your actual LINE access token
+	$line_access_token = $config['API_KEYS']['line_access_token'];
+	$openai_api_key = $config['API_KEYS']['openai_api_key'];
+	// Database connection
+	$db_host = $config['DATABASE']['db_host'];
+	$db_user = $config['DATABASE']['db_user'];
+	$db_password = $config['DATABASE']['db_password'];
+	$db_name = $config['DATABASE']['db_name'];
+	// Generate QR code URL and save image
+	$qr_code_url = $config['URLS']['qr_code_url'];
+	$line_image_url_base = $config['URLS']['line_image_url_base'];
+	$store_url = $config['URLS']['store_url'];
+	$default_prompt =  $config['USER_PROMPTS']['default_prompt'];
+	return "varset";
+}
+?>
+
+
+目錄：/hermes/bosnacweb08/bosnacweb08ar/b174/ipg.sweetekconnie46425/line/lineapi/php
+檔名：report_error.php
+==================================================
+<?php
+// Database connection
+$read_var=read_config_var();
+global $db_host,$db_user,$db_password,$db_name;
+
+//$db_host = 'sweetekconnie46425.ipagemysql.com';
+//$db_user = 'ericwang';
+//$db_password = 'Eric010101)!)!)!';
+//$db_name = 'sweetekconnie46_fvdg_qscsxdpmlak';
+
+$conn = new mysqli($db_host, $db_user, $db_password, $db_name);
+// Create connection
+//$conn = new mysqli($servername, $username, $password, $dbname);
+
+// Check connection
+if ($conn->connect_error) {
+    die("Connection failed: " . $conn->connect_error);
+}
+// Set the MySQL time zone to Asia/Taipei
+$timezone_query = "SET time_zone = 'Asia/Taipei'";
+if ($conn->query($timezone_query) === TRUE) {
+    echo "Time zone set to Asia/Taipei successfully.<br>";
+} else {
+    echo "Error setting time zone: " . $conn->error;
+}
+
+// Retrieve data from POST request
+$data = json_decode(file_get_contents('php://input'), true);
+
+$machine_id = $data['machine_id'];
+$error_message = $data['error_message'];
+$timestamp = $data['timestamp'];
+
+// Insert data into table
+$sql = "INSERT INTO machine_errors (machine_id, error_message, timestamp) VALUES ('$machine_id', '$error_message', '$timestamp')";
+
+if ($conn->query($sql) === TRUE) {
+    echo json_encode(["message" => "Error recorded successfully"]);
+} else {
+    echo json_encode(["error" => "Error: " . $sql . "<br>" . $conn->error]);
+}
+
+$conn->close();
+
+// Function to load configuration from setup.ini
+function loadConfig($ini_file = 'setup.ini') {
+    if (!file_exists($ini_file)) {
+        die("Configuration file not found: $ini_file");
+    }
+    return parse_ini_file($ini_file, true);
+}
+function read_config_var(){
+
+	$config = loadConfig(); // Load configuration from setup.ini
+    global $line_access_token, $openai_api_key, $db_host, $db_user, $db_password, $db_name;
+    global $qr_code_url, $line_image_url_base, $store_url, $default_prompt;
+	// Replace with your actual LINE access token
+	$line_access_token = $config['API_KEYS']['line_access_token'];
+	$openai_api_key = $config['API_KEYS']['openai_api_key'];
+	// Database connection
+	$db_host = $config['DATABASE']['db_host'];
+	$db_user = $config['DATABASE']['db_user'];
+	$db_password = $config['DATABASE']['db_password'];
+	$db_name = $config['DATABASE']['db_name'];
+	// Generate QR code URL and save image
+	$qr_code_url = $config['URLS']['qr_code_url'];
+	$line_image_url_base = $config['URLS']['line_image_url_base'];
+	$store_url = $config['URLS']['store_url'];
+	$default_prompt =  $config['USER_PROMPTS']['default_prompt'];
+	return "varset";
+}
+?>
+
+
+目錄：/hermes/bosnacweb08/bosnacweb08ar/b174/ipg.sweetekconnie46425/line/lineapi/php
+檔名：remote_config.php
+==================================================
+<?php
+// Database connection
+$read_var=read_config_var();
+global $db_host,$db_user,$db_password,$db_name;
+
+//$db_host = 'sweetekconnie46425.ipagemysql.com';
+//$db_user = 'ericwang';
+//$db_password = 'Eric010101)!)!)!';
+//$db_name = 'sweetekconnie46_fvdg_qscsxdpmlak';
+
+$conn = new mysqli($db_host, $db_user, $db_password, $db_name);
+
+// Check connection
+if ($conn->connect_error) {
+    die("Connection failed: " . $conn->connect_error);
+}
+
+// Retrieve the machine ID from the request
+$machine_id = $_GET['machine_id'];
+
+if ($_SERVER['REQUEST_METHOD'] === 'GET') {
+    // Get configuration data for the machine
+    $sql = "SELECT ini_content FROM machine_configs WHERE machine_id = '$machine_id' LIMIT 1";
+    $result = $conn->query($sql);
+
+    if ($result->num_rows > 0) {
+        // Machine ID exists, return ini_content
+        $row = $result->fetch_assoc();
+        echo json_encode(["ini_content" => $row['ini_content']]);
+    } else {
+        // If machine_id does not exist, copy the latest record and insert as new
+        $sql_latest = "SELECT ini_content FROM machine_configs ORDER BY id DESC LIMIT 1";
+        $result_latest = $conn->query($sql_latest);
+
+        if ($result_latest->num_rows > 0) {
+            $row_latest = $result_latest->fetch_assoc();
+            $new_ini_content = $row_latest['ini_content'];
+            // Replace "machine_uuid" in the latest config
+            $new_ini_content = preg_replace('/machine_uuid\s*=\s*\w+/', 'machine_uuid = ' . $machine_id, $new_ini_content);
+
+            // Insert new record with the modified ini_content
+            $sql_insert = "INSERT INTO machine_configs (machine_id, ini_content) VALUES ('$machine_id', '$new_ini_content')";
+
+            if ($conn->query($sql_insert) === TRUE) {
+                // Fetch the newly inserted configuration to return to the user
+                $sql_fetch_new = "SELECT ini_content FROM machine_configs WHERE machine_id = '$machine_id' LIMIT 1";
+                $result_fetch_new = $conn->query($sql_fetch_new);
+
+                if ($result_fetch_new->num_rows > 0) {
+                    $row_new = $result_fetch_new->fetch_assoc();
+                    // Return the actual ini_content in the JSON response
+                    echo json_encode([
+                        "ini_content" => $row_new['ini_content']
+                    ]);
+                } else {
+                    echo json_encode(["error" => "Error fetching newly inserted configuration"]);
+                }
+            } else {
+                echo json_encode(["error" => "Error inserting new configuration: " . $conn->error]);
+            }
+        } else {
+            echo json_encode(["error" => "No existing configuration found to copy from"]);
+        }
+    }
+} elseif ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    // Save or update configuration data for the machine
+    $data = json_decode(file_get_contents('php://input'), true);
+    $ini_content = $data['ini_content'];
+
+    $sql = "INSERT INTO machine_configs (machine_id, ini_content) VALUES ('$machine_id', '$ini_content') 
+            ON DUPLICATE KEY UPDATE ini_content = '$ini_content'";
+
+    if ($conn->query($sql) === TRUE) {
+        echo json_encode(["message" => "Configuration updated successfully for machine ID: $machine_id"]);
+    } else {
+        echo json_encode(["error" => "Error updating configuration: " . $conn->error]);
+    }
+}
+
+$conn->close();
+
+// Function to load configuration from setup.ini
+function loadConfig($ini_file = 'setup.ini') {
+    if (!file_exists($ini_file)) {
+        die("Configuration file not found: $ini_file");
+    }
+    return parse_ini_file($ini_file, true);
+}
+function read_config_var(){
+
+	$config = loadConfig(); // Load configuration from setup.ini
+    global $line_access_token, $openai_api_key, $db_host, $db_user, $db_password, $db_name;
+    global $qr_code_url, $line_image_url_base, $store_url, $default_prompt;
+	// Replace with your actual LINE access token
+	$line_access_token = $config['API_KEYS']['line_access_token'];
+	$openai_api_key = $config['API_KEYS']['openai_api_key'];
+	// Database connection
+	$db_host = $config['DATABASE']['db_host'];
+	$db_user = $config['DATABASE']['db_user'];
+	$db_password = $config['DATABASE']['db_password'];
+	$db_name = $config['DATABASE']['db_name'];
+	// Generate QR code URL and save image
+	$qr_code_url = $config['URLS']['qr_code_url'];
+	$line_image_url_base = $config['URLS']['line_image_url_base'];
+	$store_url = $config['URLS']['store_url'];
+	$default_prompt =  $config['USER_PROMPTS']['default_prompt'];
+	return "varset";
+}
+?>
+
+
+目錄：/hermes/bosnacweb08/bosnacweb08ar/b174/ipg.sweetekconnie46425/line/lineapi/php
+檔名：insert_production_log.php
+==================================================
+<?php
+
+// Database connection
+$read_var = read_config_var();
+global $db_host, $db_user, $db_password, $db_name;
+
+$conn = new mysqli($db_host, $db_user, $db_password, $db_name);
+
+// Replace with your actual LINE access token
+global $line_access_token;
+$access_token = $line_access_token;
+
+// Check connection
+if ($conn->connect_error) {
+    die(json_encode(["message" => "Connection failed: " . $conn->connect_error]));
+}
+
+// Retrieve data from POST request
+$data = json_decode(file_get_contents('php://input'), true);
+
+$machine_identifier = $conn->real_escape_string($data['machine_identifier']);
+$gpt_responses_id = $conn->real_escape_string($data['gpt_responses_id']);
+$wordpress_post_ids = $conn->real_escape_string(json_encode($data['wordpress_post_ids']));
+$media_ids = $conn->real_escape_string(json_encode($data['media_ids']));
+$woocommerce_product_ids = $conn->real_escape_string(json_encode($data['woocommerce_product_ids']));
+$running_time = $conn->real_escape_string($data['running_time']);
+
+// Insert data into production_log table
+$sql = "INSERT INTO production_log (machine_identifier, gpt_responses_id, wordpress_post_ids, media_ids, woocommerce_product_ids, running_time)
+        VALUES ('$machine_identifier', '$gpt_responses_id', '$wordpress_post_ids', '$media_ids', '$woocommerce_product_ids', '$running_time')";
+
+if ($conn->query($sql) === TRUE) {
+    $last_id = $conn->insert_id; // Get the last inserted ID
+
+    // Update article_info in gpt_responses using gpt_responses_id
+    $update_sql = "UPDATE gpt_responses SET article_info = '$wordpress_post_ids' WHERE id = '$gpt_responses_id'";
+    if ($conn->query($update_sql) === TRUE) {
+
+        // Get user_id and replytoken from gpt_responses using gpt_responses_id
+        $user_sql = "SELECT user_id, replytoken FROM gpt_responses WHERE id = '$gpt_responses_id' LIMIT 1";
+        $user_result = $conn->query($user_sql);
+
+        if ($user_result->num_rows > 0) {
+            $row = $user_result->fetch_assoc();
+            $user_id = $row['user_id'];
+            $replyToken = $row['replytoken'];
+
+            // Prepare the message for the user
+            global $store_url;
+            $message = "已經為您生成的一個post, 您可以到此連結觀看成果 = " . $store_url . "?p=" . $wordpress_post_ids;
+
+            // Send the reply message to the user
+            $result = pushMessage($user_id, $message);
+
+            if ($result['success']) {
+                echo json_encode(["message" => "Record inserted with ID: " . $last_id . " and user notified successfully. Article info updated."]);
+            } else {
+                echo json_encode(["message" => "Record inserted with ID: " . $last_id . ", but failed to notify user. Article info updated."]);
+            }
+        } else {
+            echo json_encode(["message" => "Record inserted with ID: " . $last_id . ", but user ID not found for the given gpt_responses_id. Article info updated."]);
+        }
+    } else {
+        echo json_encode(["message" => "Record inserted with ID: " . $last_id . ", but failed to update article info: " . $conn->error]);
+    }
+} else {
+    echo json_encode(["message" => "Error: " . $sql . " - " . $conn->error]);
+}
+
+$conn->close();
+
+// Function to send the reply to the user via LINE Messaging API
+function pushMessage($userId, $message) {
+$response="happy";
+return ['success' => true, 'response' => $response];
+    global $access_token;
+
+    $url = 'https://api.line.me/v2/bot/message/push';
+    $data = [
+        'to' => $userId,
+        'messages' => [
+            [
+                'type' => 'text',
+                'text' => $message
+            ]
+        ]
+    ];
+
+    $post = json_encode($data);
+    $headers = [
+        'Content-Type: application/json',
+        'Authorization: Bearer ' . $access_token
+    ];
+
+    $ch = curl_init($url);
+    curl_setopt($ch, CURLOPT_POST, true);
+    curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    curl_setopt($ch, CURLOPT_POSTFIELDS, $post);
+
+    $response = curl_exec($ch);
+    $http_code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+
+    if (curl_errno($ch)) {
+        curl_close($ch);
+        return ['success' => false, 'error' => curl_error($ch)];
+    } else {
+        curl_close($ch);
+        if ($http_code === 200) {
+            return ['success' => true, 'response' => $response];
+        } else {
+            return ['success' => false, 'error' => "HTTP Code: $http_code", 'response' => $response];
+        }
+    }
+}
+
+// Function to load configuration from setup.ini
+function loadConfig($ini_file = 'setup.ini') {
+    if (!file_exists($ini_file)) {
+        die("Configuration file not found: $ini_file");
+    }
+    return parse_ini_file($ini_file, true);
+}
+
+// Function to read configuration variables
+function read_config_var() {
+    $config = loadConfig(); // Load configuration from setup.ini
+    global $line_access_token, $openai_api_key, $db_host, $db_user, $db_password, $db_name;
+    global $qr_code_url, $line_image_url_base, $store_url, $default_prompt;
+
+    // Replace with your actual LINE access token and OpenAI API key
+    $line_access_token = $config['API_KEYS']['line_access_token'];
+    $openai_api_key = $config['API_KEYS']['openai_api_key'];
+
+    // Database connection
+    $db_host = $config['DATABASE']['db_host'];
+    $db_user = $config['DATABASE']['db_user'];
+    $db_password = $config['DATABASE']['db_password'];
+    $db_name = $config['DATABASE']['db_name'];
+
+    // Other configuration
+    $qr_code_url = $config['URLS']['qr_code_url'];
+    $line_image_url_base = $config['URLS']['line_image_url_base'];
+    $store_url = $config['URLS']['store_url'];
+    $default_prompt = $config['USER_PROMPTS']['default_prompt'];
+
+    return "varset";
+}
+
+
+目錄：/hermes/bosnacweb08/bosnacweb08ar/b174/ipg.sweetekconnie46425/line/lineapi/php
+檔名：config.php
+==================================================
+<?php
+// config.php
+
+// API Keys
+$line_access_token = 'E551NpPT8+aG9ujdrAJ/HqvnOglmWhHMFnzEYxNIkoBiZOGLG4GE/73ktgPeDILOLJAsAlNLbUlKYld+6l+RoiNKPMSboWWpdHyHpqjoKkSLu0PV2As+Owi1680aR0aoTsiY1IyKiLHYXABU1hzALQdB04t89/1O/w1cDnyilFU=';
+$openai_api_key = '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';
+
+// Database credentials
+$db_host = 'sweetekconnie46425.ipagemysql.com';
+$db_user = 'ericwang';
+$db_password = 'Eric010101)!)!)!';
+$db_name = 'sweetekconnie46_fvdg_qscsxdpmlak';
+
+// URL configurations
+$qr_code_url = 'https://api.qrserver.com/v1/create-qr-code/?size=150x150&data=';
+$line_image_url_base = 'https://line.heatgroups.com/lineapi/php/';
+$store_url = 'https://stores.heatgroups.com/';
+
+// Default prompt
+$default_prompt = 'AI Magic for image generation';
+?>
+
+
+
+目錄：/hermes/bosnacweb08/bosnacweb08ar/b174/ipg.sweetekconnie46425/line/lineapi/php
+檔名：database.php
+==================================================
+<?php
+// database.php
+
+require_once 'config.php';
+require_once 'utility.php';
+
+// 建立資料庫連接
+function getDatabaseConnection() {
+    global $db_host, $db_user, $db_password, $db_name;
+
+    $conn = new mysqli($db_host, $db_user, $db_password, $db_name);
+
+    if ($conn->connect_error) {
+        logme("資料庫連接失敗: " . $conn->connect_error);
+        die("資料庫連接失敗: " . $conn->connect_error);
+    }
+
+    // 設置字元集
+    if (!$conn->set_charset("utf8mb4")) {
+        logme("Error loading character set utf8mb4: " . $conn->error);
+        exit();
+    }
+
+    return $conn;
+}
+
+// 判斷是否為新用戶
+function isNewUser($conn, $user_id) {
+    $stmt = $conn->prepare("SELECT user_id FROM user_data WHERE user_id = ?");
+    $stmt->bind_param('s', $user_id);
+    $stmt->execute();
+    $stmt->store_result();
+
+    $is_new_user = $stmt->num_rows === 0;
+    logme("isNewUser for user_id $user_id: " . ($is_new_user ? "Yes" : "No"));
+
+    $stmt->close();
+    return $is_new_user;
+}
+
+// 保存新用戶數據
+function saveNewUserData($conn, $user_id, $line_user_name, $qr_content) {
+    $stmt = $conn->prepare("INSERT INTO user_data (user_id, user_name, status, daily_quota, remaining_quota, balance, qr_content, last_reset_date) 
+                            VALUES (?, ?, 'active', 2, 2, 0.00, ?, CURDATE())");
+    $stmt->bind_param('sss', $user_id, $line_user_name, $qr_content);
+
+    if ($stmt->execute()) {
+        logme("新用戶數據保存成功: $user_id");
+        $stmt->close();
+        return true;
+    } else {
+        logme("新用戶數據保存失敗: " . $stmt->error);
+        $stmt->close();
+        return false;
+    }
+}
+
+// 檢查用戶配額
+function hasQuota($conn, $user_id) {
+    $stmt = $conn->prepare("SELECT remaining_quota FROM user_data WHERE user_id = ?");
+    $stmt->bind_param('s', $user_id);
+    $stmt->execute();
+    $stmt->bind_result($remaining_quota);
+    $stmt->fetch();
+    $stmt->close();
+
+    logme("User $user_id has remaining quota: $remaining_quota");
+    return $remaining_quota;
+}
+
+// 扣除用戶配額
+function deductQuota($conn, $user_id) {
+    $stmt = $conn->prepare("UPDATE user_data SET remaining_quota = remaining_quota - 1 WHERE user_id = ? AND remaining_quota > 0");
+    $stmt->bind_param('s', $user_id);
+    if ($stmt->execute()) {
+        logme("用戶配額扣除成功: $user_id");
+    } else {
+        logme("用戶配額扣除失敗: " . $stmt->error);
+    }
+    $stmt->close();
+}
+
+// 更新用戶名
+function updateUserName($conn, $user_id, $line_user_name) {
+    $stmt = $conn->prepare("UPDATE user_data SET user_name = ? WHERE user_id = ?");
+    $stmt->bind_param('ss', $line_user_name, $user_id);
+    if ($stmt->execute()) {
+        logme("用戶名更新成功: $user_id");
+    } else {
+        logme("用戶名更新失敗: " . $stmt->error);
+    }
+    $stmt->close();
+}
+
+// 檢查 QR Code 是否有效
+function isValidQRCode($conn, $qr_content, $user_id) {
+    $stmt = $conn->prepare("SELECT qr_content FROM user_data WHERE user_id = ? AND ? LIKE CONCAT(qr_content, '%')");
+    $stmt->bind_param('ss', $user_id, $qr_content);
+    $stmt->execute();
+    $stmt->store_result();
+
+    $is_valid = $stmt->num_rows > 0;
+    logme("isValidQRCode for user_id $user_id: " . ($is_valid ? "Yes" : "No"));
+
+    $stmt->close();
+    return $is_valid;
+}
+
+// 保存 QR Code 結果到資料庫
+function saveQRCodeResult($conn, $user_id, $image_path, $qr_content) {
+    $stmt = $conn->prepare("INSERT INTO qr_results (line_user_id, image_path, qr_content) VALUES (?, ?, ?)");
+    $stmt->bind_param('sss', $user_id, $image_path, $qr_content);
+
+    if ($stmt->execute()) {
+        logme("QR Code 結果保存成功: $user_id");
+    } else {
+        logme("QR Code 結果保存失敗: " . $stmt->error);
+    }
+    $stmt->close();
+}
+
+
+function saveGptResponseToDatabase($conn, $user_id, $replyToken, $image_path, $image_url, $gpt_question, $gpt_prompt_json, $gpt_ans) {
+    // 獲取可用的機器 ID
+    $task_machine_uuid = getAvailableMachine($conn);
+    $q_date = date('Y-m-d H:i:s');
+
+    // 組合 user_id, image_url, q_date 生成唯一碼
+    $unique_string = $user_id . $image_url . $q_date;
+    $event_code = hash('md5', $unique_string); // 使用 MD5 生成哈希碼
+
+    // 準備 SQL 語句
+    $stmt = $conn->prepare("INSERT INTO gpt_responses (user_id, replytoken, image_path, image_url, gpt_question, gpt_prompt_json, q_date, task_machine_uuid, gpt_ans, event_code) 
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+    $stmt->bind_param('ssssssssss', $user_id, $replyToken, $image_path, $image_url, $gpt_question, $gpt_prompt_json, $q_date, $task_machine_uuid, $gpt_ans, $event_code);
+
+    // 執行插入並檢查結果
+    if ($stmt->execute()) {
+        // 取得自動生成的 ID
+        $record_id = $stmt->insert_id;
+        logme("GPT 回應保存成功: $user_id, Record ID: $record_id, Event Code: $event_code");
+		['response1' => $response1, 'response2' => $response2];
+        return ['event_code' => $event_code, 'record_id' => $record_id];  // 回傳 $event_code, record_id
+    } else {
+        logme("GPT 回應保存失敗: " . $stmt->error);
+        return false;  // 保存失敗時回傳 false
+    }
+    $stmt->close();
+}
+
+// 獲取可用的機器
+function getAvailableMachine($conn) {
+    $sql = "SELECT machine_id FROM machine_status WHERE switch = 'on' ORDER BY RAND() LIMIT 1";
+    $result = $conn->query($sql);
+
+    if ($result && $result->num_rows > 0) {
+        $row = $result->fetch_assoc();
+        $machine_id = $row['machine_id'];
+        logme("Available machine found: $machine_id");
+        return $machine_id;
+    } else {
+        logme("No available machine found");
+        return null;
+    }
+}
+?>
+
+
+目錄：/hermes/bosnacweb08/bosnacweb08ar/b174/ipg.sweetekconnie46425/line/lineapi/php
+檔名：line_functions.php
+==================================================
+<?php
+// line_functions.php
+
+require_once 'config.php';
+require_once 'utility.php';
+
+// 回復消息給用戶
+function replyMessage($replyToken, $messages) {
+    global $line_access_token;
+    $url = 'https://api.line.me/v2/bot/message/reply';
+
+    $data = [
+        'replyToken' => $replyToken,
+        'messages' => $messages
+    ];
+
+    $post = json_encode($data, JSON_UNESCAPED_UNICODE);
+    $headers = [
+        'Content-Type: application/json',
+        'Authorization: Bearer ' . $line_access_token
+    ];
+
+    $ch = curl_init($url);
+    curl_setopt($ch, CURLOPT_POST, true);
+    curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    curl_setopt($ch, CURLOPT_POSTFIELDS, $post);
+    $result = curl_exec($ch);
+
+    if (curl_errno($ch)) {
+        logme("Reply message failed: " . curl_error($ch));
+    } else {
+        logme("Reply message success: " . $result);
+    }
+
+    curl_close($ch);
+}
+
+// 下載用戶上傳的圖片
+function downloadImage($message_id) {
+    global $line_access_token;
+    $url = "https://api-data.line.me/v2/bot/message/$message_id/content";
+    $headers = ['Authorization: Bearer ' . $line_access_token];
+
+    $ch = curl_init($url);
+    curl_setopt($ch, CURLOPT_TIMEOUT, 60);
+    curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 30);
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
+    $image_data = curl_exec($ch);
+
+    if (curl_errno($ch)) {
+        logme("Download image failed: " . curl_error($ch));
+        curl_close($ch);
+        return false;
+    }
+
+    curl_close($ch);
+
+    // 確保目錄存在
+    $directory = 'images/';
+    if (!is_dir($directory)) {
+        mkdir($directory, 0755, true);
+    }
+
+    $image_path = $directory . $message_id . '.jpg';
+    file_put_contents($image_path, $image_data);
+    logme("Image saved: $image_path");
+
+    return $image_path;
+}
+
+// 獲取用戶資訊
+function getUserProfile($user_id) {
+    global $line_access_token;
+    $url = 'https://api.line.me/v2/bot/profile/' . $user_id;
+    $headers = [
+        'Authorization: Bearer ' . $line_access_token
+    ];
+
+    $ch = curl_init($url);
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
+    $response = curl_exec($ch);
+
+    if (curl_errno($ch)) {
+        logme("Get user profile failed: " . curl_error($ch));
+        curl_close($ch);
+        return null;
+    }
+
+    curl_close($ch);
+
+    $profile = json_decode($response, true);
+
+    if (json_last_error() !== JSON_ERROR_NONE) {
+        logme("Failed to decode user profile JSON: " . json_last_error_msg());
+        return null;
+    }
+
+    logme("User profile retrieved: " . json_encode($profile, JSON_UNESCAPED_UNICODE));
+
+    return $profile;
+}
+?>
+
+
+目錄：/hermes/bosnacweb08/bosnacweb08ar/b174/ipg.sweetekconnie46425/line/lineapi/php
+檔名：qr_code_functions.php
+==================================================
+<?php
+// qr_code_functions.php
+
+require_once 'config.php';
+require_once 'utility.php';
+
+// 生成並保存 QR Code
+function saveQRCode($user_id) {
+    global $qr_code_url;
+    $qr_content = "HWAIS-" . $user_id;
+    $qr_url = $qr_code_url . urlencode($qr_content);
+
+    $save_directory = 'qrcodes/';
+    $qr_code_file = $save_directory . $qr_content . '.png';
+
+    if (!file_exists($save_directory)) {
+        mkdir($save_directory, 0755, true);
+    }
+
+    $ch = curl_init($qr_url);
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
+    $qr_code_image = curl_exec($ch);
+
+    if (curl_errno($ch)) {
+        logme("QR Code generation failed: " . curl_error($ch));
+        curl_close($ch);
+        return false;
+    }
+
+    curl_close($ch);
+
+    $result = file_put_contents($qr_code_file, $qr_code_image);
+
+    if ($result === false) {
+        logme("Failed to save QR code image to: $qr_code_file");
+        return false;
+    }
+
+    logme("QR Code generated and saved to: $qr_code_file");
+    return $qr_code_file;
+}
+
+// 將 QR Code 附加到圖片
+function attachQRCodeToImage($image_path, $qr_code_path) {
+    // 檢測圖片類型（JPEG 或 PNG）
+    $image_info = getimagesize($image_path);
+    $image_mime = $image_info['mime'];
+
+    if ($image_mime == 'image/jpeg') {
+        $image = imagecreatefromjpeg($image_path);
+    } elseif ($image_mime == 'image/png') {
+        $image = imagecreatefrompng($image_path);
+    } else {
+        logme("Unsupported image format: $image_mime");
+        return false;
+    }
+
+    $qr_code = imagecreatefrompng($qr_code_path);
+
+    // 調整 QR Code 大小
+    $image_width = imagesx($image);
+    $image_height = imagesy($image);
+    $qr_size = min($image_width, $image_height) / 8;
+
+    $resized_qr = imagecreatetruecolor($qr_size, $qr_size);
+    imagealphablending($resized_qr, false);
+    imagesavealpha($resized_qr, true);
+    imagecopyresampled($resized_qr, $qr_code, 0, 0, 0, 0, $qr_size, $qr_size, imagesx($qr_code), imagesy($qr_code));
+
+    // 將 QR Code 放置在圖片右下角
+    $qr_x = $image_width - $qr_size - 10;
+    $qr_y = $image_height - $qr_size - 10;
+
+    imagecopy($image, $resized_qr, $qr_x, $qr_y, 0, 0, $qr_size, $qr_size);
+
+    // 保存修改後的圖片
+    $modified_image_path = 'images/modified_' . basename($image_path);
+
+    if ($image_mime == 'image/jpeg') {
+        imagejpeg($image, $modified_image_path);
+    } elseif ($image_mime == 'image/png') {
+        imagepng($image, $modified_image_path);
+    }
+
+    // 釋放記憶體
+    imagedestroy($image);
+    imagedestroy($resized_qr);
+    imagedestroy($qr_code);
+
+    logme("Image with QR Code saved: $modified_image_path");
+    return $modified_image_path;
+}
+
+// 解碼圖片中的 QR Code
+function decodeQRCodeUsingAPI($image_path) {
+    $url = 'https://api.qrserver.com/v1/read-qr-code/';
+    $post_data = ['file' => new CURLFile($image_path)];
+
+    $ch = curl_init($url);
+    curl_setopt($ch, CURLOPT_POST, 1);
+    curl_setopt($ch, CURLOPT_POSTFIELDS, $post_data);
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    $response = curl_exec($ch);
+
+    if (curl_errno($ch)) {
+        logme("QR Code decoding failed: " . curl_error($ch));
+        curl_close($ch);
+        return "無法讀取二維碼";
+    }
+
+    curl_close($ch);
+
+    $result = json_decode($response, true);
+
+    if (json_last_error() !== JSON_ERROR_NONE) {
+        logme("Failed to decode QR code JSON: " . json_last_error_msg());
+        return "無法讀取二維碼";
+    }
+
+    if (isset($result[0]['symbol'][0]['data'])) {
+        $qr_content = $result[0]['symbol'][0]['data'];
+        logme("QR Code decoded: $qr_content");
+        return $qr_content;
+    } else {
+        logme("QR Code decoding failed: No data found");
+        return "無法讀取二維碼";
+    }
+}
+?>
+
+
+目錄：/hermes/bosnacweb08/bosnacweb08ar/b174/ipg.sweetekconnie46425/line/lineapi/php
+檔名：gpt_functions.php
+==================================================
+<?php
+// gpt_functions.php
+
+require_once 'config.php';
+require_once 'utility.php';
+require_once 'database.php'; // 添加此行以獲取資料庫連接
+
+// 調用 GPT-4 API
+function askGPT($user_id, $image_path, $qr_content) {
+    global $line_image_url_base;
+    $image_url = $line_image_url_base . ltrim($image_path, '../');
+
+    // 從資料庫獲取特別處理過的 GPT 提示
+    $randomPromptData = getRandomPromptData();
+    $question = $randomPromptData['positive_prompt'];
+
+    logme("Using GPT prompt: $question");
+
+    // 調用 GPT-4 API
+    $gpt_response = ask_gpt4($question, $image_url);
+
+    if ($gpt_response) {
+        // 記錄原始 GPT-4 回應
+        logme("Raw GPT-4 response: $gpt_response");
+
+        // 提取需要的數據
+        //$extracted_data = extract_data_from_gpt_output($user_id, $gpt_response);
+		$result = extract_data_from_gpt_output($user_id, $gpt_response);
+		if ($result) {
+			$extracted_data  = $result['response1'];
+			$extracted_data2 = $result['response2'];
+		}	
+        $conn = getDatabaseConnection();
+        global $replyToken;
+        if ($extracted_data !== false) {
+            // 保存 GPT 回應到資料庫
+			logme("保存 GPT 回應到資料庫111.");
+            $result = saveGptResponseToDatabase($conn, $user_id, $replyToken, $image_path, $image_url, $question, json_encode($extracted_data2, JSON_UNESCAPED_UNICODE), $gpt_response);
+			//$result = extract_data_from_gpt_output($user_id, $gpt_response);
+			if ($result) {
+				$event_code  = $result['event_code'];
+				$record_id = $result['record_id'];
+			}	
+            $conn->close();
+			
+            return ['extracted_data' => $extracted_data, 'extracted_data2' => $extracted_data2, 'event_code' => $event_code, 'record_id' => $record_id];
+			
+        } else {
+            logme("Failed to extract data from GPT response.");
+            // 即使提取失敗，也將原始 GPT 回應保存到資料庫
+			logme("即使提取失敗，也將原始 GPT 回應保存到資料庫.");
+            saveGptResponseToDatabase($conn, $user_id, $replyToken, $image_path, $image_url, $question, null, $gpt_response);
+            $conn->close();
+            return null;
+        }
+    } else {
+        logme("Failed to get GPT response.");
+        return null;
+    }
+}
+
+function ask_gpt4($question, $image_url) {
+    global $openai_api_key;
+
+    $url = 'https://api.openai.com/v1/chat/completions';
+
+    $data = [
+        'model' => 'gpt-4o-2024-08-06',
+     'messages' => [
+            [
+                'role' => 'user',
+                'content' => [
+                    [
+                        'type' => 'text',
+                        'text' => $question
+                    ],
+                    [
+                        'type' => 'image_url',
+                        'image_url' => ['url' => $image_url ]
+                    ]
+                ]
+            ]
+        ],
+        'max_tokens' => 2000, // Adjust as needed
+        'temperature' => 0.7 // Adjust as needed
+    ];
+
+    // 使用 JSON_UNESCAPED_UNICODE 確保中文字元不被轉義
+    $post_data = json_encode($data, JSON_UNESCAPED_UNICODE);
+
+    logme("Sending request to GPT-4 API with data: $post_data");
+
+    $ch = curl_init($url);
+    curl_setopt($ch, CURLOPT_TIMEOUT, 120);
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    curl_setopt($ch, CURLOPT_HTTPHEADER, [
+        'Content-Type: application/json',
+        'Authorization: Bearer ' . $openai_api_key
+    ]);
+    curl_setopt($ch, CURLOPT_POSTFIELDS, $post_data);
+
+    $response = curl_exec($ch);
+
+    if (curl_errno($ch)) {
+        logme("GPT-4 API call failed: " . curl_error($ch));
+        curl_close($ch);
+        return null;
+    }
+
+    curl_close($ch);
+
+    logme("GPT-4 API raw response: $response");
+
+    $response_data = json_decode($response, true);
+
+    if (json_last_error() !== JSON_ERROR_NONE) {
+        logme("Failed to decode GPT-4 API response JSON: " . json_last_error_msg());
+        return null;
+    }
+
+    if (isset($response_data['choices'][0]['message']['content'])) {
+        $gpt_content = $response_data['choices'][0]['message']['content'];
+        logme("GPT-4 response content: $gpt_content");
+        return $gpt_content;
+    } else {
+        logme("GPT-4 API response error: " . json_encode($response_data, JSON_UNESCAPED_UNICODE));
+        return null;
+    }
+}
+
+// 從 GPT 回應中提取需要的數據
+function extract_data_from_gpt_output($user_id, $gpt_output) {
+    // 記錄 GPT 輸出
+    logme("Extracting data from GPT output for user: $user_id");
+
+    // 嘗試將 GPT 回應解析為 JSON
+    $data = json_decode($gpt_output, true);
+
+    if (json_last_error() === JSON_ERROR_NONE && is_array($data)) {
+        logme("JSON decoded successfully.");
+
+		// 提取第一組數據
+		$creative_title = isset($data['專欄標題']) ? $data['專欄標題'] : '無專欄標題資料';
+		$picture_analysis = isset($data['圖片分析']) ? $data['圖片分析'] : '無圖片分析資料';
+		$creative_inspiration = isset($data['創作靈感']) ? $data['創作靈感'] : '無創作靈感資料';
+
+		// 提取第二組數據
+		$category = isset($data['category']) ? $data['category'] : 'analysis failed';
+		$artist = isset($data['artist']) ? $data['artist'] : 'analysis failed';
+		$style = isset($data['style']) ? $data['style'] : 'analysis failed';
+		$prompt = isset($data['prompt']) ? $data['prompt'] : 'analysis failed';
+
+		logme("Extracted data - 專欄標題: $creative_title, 圖片分析: $picture_analysis, 創作靈感: $creative_inspiration");
+		logme("Extracted data - category: $category, artist: $artist, style: $style, prompt: $prompt");
+
+		// 構建兩個返回值
+		$response1 = [
+			'專欄標題' => $creative_title,
+			'圖片分析' => $picture_analysis,
+			'創作靈感' => $creative_inspiration
+		];
+
+		$response2 = [
+			'category' => $category,
+			'artist' => $artist,
+			'style' => $style,
+			'prompt' => $prompt
+		];
+
+		return ['response1' => $response1, 'response2' => $response2];
+    } else {
+        logme("JSON decode error: " . json_last_error_msg());
+
+        // 嘗試從 GPT 回應中提取 JSON 塊
+        $pattern = '/\{(?:[^{}]|(?R))*\}/su';
+        preg_match($pattern, $gpt_output, $matches);
+
+        if (!empty($matches)) {
+            $json_string = $matches[0];
+            logme("Extracted JSON string: $json_string");
+            $data = json_decode($json_string, true);
+
+            if (json_last_error() === JSON_ERROR_NONE && is_array($data)) {
+                logme("JSON decoded successfully from extracted string.");
+
+				// 提取第一組數據
+				$creative_title = isset($data['專欄標題']) ? $data['專欄標題'] : '無專欄標題資料';
+				$picture_analysis = isset($data['圖片分析']) ? $data['圖片分析'] : '無圖片分析資料';
+				$creative_inspiration = isset($data['創作靈感']) ? $data['創作靈感'] : '無創作靈感資料';
+
+				// 提取第二組數據
+				$category = isset($data['category']) ? $data['category'] : 'analysis failed';
+				$artist = isset($data['artist']) ? $data['artist'] : 'analysis failed';
+				$style = isset($data['style']) ? $data['style'] : 'analysis failed';
+				$prompt = isset($data['prompt']) ? $data['prompt'] : 'analysis failed';
+
+				logme("Extracted data - 專欄標題: $creative_title, 圖片分析: $picture_analysis, 創作靈感: $creative_inspiration");
+				logme("Extracted data - category: $category, artist: $artist, style: $style, prompt: $prompt");
+
+				// 構建兩個返回值
+				$response1 = [
+					'專欄標題' => $creative_title,
+					'圖片分析' => $picture_analysis,
+					'創作靈感' => $creative_inspiration
+				];
+
+				$response2 = [
+					'category' => $category,
+					'artist' => $artist,
+					'style' => $style,
+					'prompt' => $prompt
+				];
+
+				return ['response1' => $response1, 'response2' => $response2];
+
+            } else {
+                logme("JSON decode error from extracted string: " . json_last_error_msg());
+				//logme("JSON decode error: " . json_last_error_msg());
+				return ['response1' => default_response1(), 'response2' => default_response2()];
+                //return false;
+            }
+        } else {
+			logme("JSON decode error: " . json_last_error_msg());
+			return ['response1' => default_response1(), 'response2' => default_response2()];
+        }
+    }
+}
+
+function default_response1() {
+    return [
+        '專欄標題' => '無專欄標題資料',
+        '圖片分析' => '無圖片分析資料',
+        '創作靈感' => '無創作靈感資料'
+    ];
+}
+
+function default_response2() {
+    return [
+        'category' => 'analysis failed',
+        'artist' => 'analysis failed',
+        'style' => 'analysis failed',
+        'prompt' => 'analysis failed'
+    ];
+}
+
+// 從資料庫獲取特別處理過的 GPT 提示
+function getRandomPromptData() {
+    $conn = getDatabaseConnection();
+    $sql = "SELECT * FROM prompt_data WHERE status = 'active' ORDER BY RAND() LIMIT 1";
+    $result = $conn->query($sql);
+
+    if ($result && $result->num_rows > 0) {
+        $promptData = $result->fetch_assoc();
+        logme("Random prompt data retrieved: " . json_encode($promptData, JSON_UNESCAPED_UNICODE));
+        $conn->close();
+        return $promptData;
+    } else {
+        logme("No prompt data found.");
+        $conn->close();
+        return null;
+    }
+}
+?>
+
+
+目錄：/hermes/bosnacweb08/bosnacweb08ar/b174/ipg.sweetekconnie46425/line/lineapi/php
+檔名：setup.ini
+==================================================
+; setup.ini
+
+[API_KEYS]
+line_access_token = "E551NpPT8+aG9ujdrAJ/HqvnOglmWhHMFnzEYxNIkoBiZOGLG4GE/73ktgPeDILOLJAsAlNLbUlKYld+6l+RoiNKPMSboWWpdHyHpqjoKkSLu0PV2As+Owi1680aR0aoTsiY1IyKiLHYXABU1hzALQdB04t89/1O/w1cDnyilFU="
+openai_api_key = "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"
+
+[DATABASE]
+db_host = "sweetekconnie46425.ipagemysql.com"
+db_user = "ericwang"
+db_password = "Eric010101)!)!)!"
+db_name = "sweetekconnie46_fvdg_qscsxdpmlak"
+
+[URLS]
+qr_code_url = "https://api.qrserver.com/v1/create-qr-code/?size=150x150&data="
+line_image_url_base = "https://line.heatgroups.com/lineapi/php/"
+store_url = "https://stores.heatgroups.com/"
+
+[USER_PROMPTS]
+default_prompt = "AI Magic for image generation"
+
+
+目錄：/hermes/bosnacweb08/bosnacweb08ar/b174/ipg.sweetekconnie46425/line/lineapi/php
+檔名：utility.php
+==================================================
+<?php
+// utility.php
+
+// 日誌記錄函數
+function logme($message) {
+    // 定義日誌檔的路徑
+    $log_file = 'line_webhook.log';
+
+    // 格式化消息，添加時間戳
+    $formatted_message = "[" . date("Y-m-d H:i:s") . "] " . $message . "\n";
+
+    // 確保使用 UTF-8 編碼寫入檔
+    file_put_contents($log_file, $formatted_message, FILE_APPEND | LOCK_EX);
+}
+?>
+
+
+目錄：/hermes/bosnacweb08/bosnacweb08ar/b174/ipg.sweetekconnie46425/line/lineapi/php
+檔名：findpost.php
+==================================================
+<?php
+ob_start(); // 開啟輸出緩衝區，避免意外輸出
+
+require_once 'config.php';
+require_once 'utility.php';
+
+// Database connection
+global $db_host, $db_user, $db_password, $db_name;
+$conn = new mysqli($db_host, $db_user, $db_password, $db_name);
+
+// Check connection
+if ($conn->connect_error) {
+    die(json_encode(["message" => "Connection failed: " . $conn->connect_error]));
+}
+
+// Retrieve gpt_id and user_id from the query string
+$gpt_id = isset($_GET['gpt_id']) ? $conn->real_escape_string($_GET['gpt_id']) : null;
+$user_id = isset($_GET['user_id']) ? $conn->real_escape_string($_GET['user_id']) : null;
+
+if ($gpt_id === null && $user_id === null) {
+    echo json_encode(["message" => "Error: gpt_id or user_id is required"]);
+    exit();
+}
+
+// Prepare the SQL query based on the available parameters
+if ($gpt_id !== null) {
+    // Query by gpt_id
+    $sql = "SELECT article_info FROM gpt_responses WHERE id = '$gpt_id' LIMIT 1";
+} elseif ($user_id !== null) {
+    // Query by user_id, getting the most recent post (assuming q_date is the column for timestamp)
+    $sql = "SELECT article_info FROM gpt_responses WHERE user_id = '$user_id' ORDER BY q_date DESC LIMIT 1";
+}
+
+$result = $conn->query($sql);
+
+if ($result->num_rows > 0) {
+    $row = $result->fetch_assoc();
+    $article_info = $row['article_info'];
+
+    // Check if article_info is null or empty
+    if (empty($article_info)) {
+        echo "<h2 style='font-family: Arial, sans-serif; color: #FF4500;'>作品正在生成中，讓AI再打磨一下，精彩馬上來！⏳</h2>";
+        ob_end_flush(); // 刷新輸出緩衝區，將內容輸出到客戶端
+    } else {
+        // Prepare the store URL and redirect to the post
+        global $store_url;
+        $redirect_url = $store_url . "?p=" . $article_info;
+
+        // Redirect to the post URL
+        header("Location: " . $redirect_url);
+        exit(); // 確保重定向後停止腳本執行
+    }
+} else {
+    echo json_encode(["message" => "Error: No response found for the given gpt_id or user_id"]);
+}
+
+$conn->close();
+?>
+
+
+目錄：/hermes/bosnacweb08/bosnacweb08ar/b174/ipg.sweetekconnie46425/line/lineapi/php
+檔名：wechathook.php
+==================================================
+<?php
+// 基本配置
+define("TOKEN", "WxEqualsecureToken2024");
+define("DB_HOST", "sweetekconnie46425.ipagemysql.com");
+define("DB_USER", "ericwang");
+define("DB_PASS", "Eric010101)!)!)!");
+define("DB_NAME", "wechat_bot");
+define("CACHE_DIR", __DIR__.'/cache/');
+
+// 设置字符编码
+header('Content-Type: text/html; charset=utf-8');
+mb_internal_encoding('UTF-8');
+
+// 错误报告设置
+error_reporting(E_ALL);
+ini_set('display_errors', 1);
+ini_set('log_errors', 1);
+ini_set('error_log', __DIR__.'/php_errors.log');
+
+// 初始化数据库连接
+$db = new mysqli(DB_HOST, DB_USER, DB_PASS, DB_NAME);
+if ($db->connect_error) {
+    error_log("数据库连接失败: " . $db->connect_error);
+    die("服务暂不可用");
+}
+// 设置数据库字符集
+$db->set_charset("utf8");
+
+// 微信验证函数
+function validate() {
+    if (!checkSignature()) {
+        header("HTTP/1.1 403 Forbidden");
+        exit;
+    }
+    echo $_GET['echostr'];
+    exit;
+}
+
+function checkSignature() {
+    $signature = $_GET["signature"] ?? '';
+    $timestamp = $_GET["timestamp"] ?? '';
+    $nonce = $_GET["nonce"] ?? '';
+    
+    if (empty($signature) || empty($timestamp) || empty($nonce)) {
+        return false;
+    }
+
+    $token = defined('TOKEN') ? TOKEN : '';
+    $tmpArr = [$token, $timestamp, $nonce];
+    sort($tmpArr, SORT_STRING);
+    $tmpStr = sha1(implode($tmpArr));
+    
+    return hash_equals($tmpStr, $signature);
+}
+
+// 微信验证入口
+if (isset($_GET['echostr'])) {
+    validate();
+}
+
+// 主处理逻辑
+http_response_code(200); // 确保返回HTTP 200
+$postData = file_get_contents("php://input");
+log_message("收到原始消息:\n" . $postData);
+
+try {
+    $data = simplexml_load_string($postData);
+    if ($data === false) {
+        throw new Exception("XML解析失败");
+    }
+    
+    $openid = (string)$data->FromUserName;
+    $userState = get_user_state($openid);
+    
+    // 设置超时控制
+    set_time_limit(28);
+    $startTime = microtime(true);
+    
+    // 处理消息
+    $response = process_message($data, $userState);
+    
+    // 超时处理
+    if ((microtime(true) - $startTime) > 28) {
+        $response = "系统处理超时，请重新发送指令";
+    }
+    
+    // 发送回复
+    if (!empty($response)) {
+        reply_text($openid, $response);
+    }
+    
+} catch (Exception $e) {
+    log_message("处理异常: " . $e->getMessage());
+    reply_text($openid, "系统繁忙，请稍后再试");
+}
+
+// 清理缓存状态
+cleanup_states($openid);
+exit;
+
+// 核心处理函数
+function process_message($data, &$userState) {
+    global $db;
+    
+    $msgType = (string)$data->MsgType;
+    $content = ($msgType == 'text') ? trim((string)$data->Content) : '';
+    
+    // 处理事件类型
+    if ($msgType == 'event') {
+        $event = (string)$data->Event;
+        switch ($event) {
+            case 'subscribe':
+                return handle_first_subscribe($data);
+            case 'unsubscribe':
+                return handle_unsubscribe($data);
+            default:
+                return "未知事件类型";
+        }
+    }
+    
+    // 处理消息类型
+    switch ($userState['stage']) {
+        case 'new_user':
+            return handle_new_user($data, $userState);
+            
+        case 'nickname_set':
+            return handle_nickname($data, $userState);
+            
+        case 'channel_selected':
+            return handle_channel_selection($data, $userState);
+            
+        case 'active_user':
+            if ($msgType == 'image') {
+                return handle_image($data, $userState);
+            }
+            return handle_active_user($content, $userState);
+            
+        default:
+            return "无效指令，请重新输入";
+    }
+}
+
+// 处理取消关注事件
+function handle_unsubscribe($data) {
+    $openid = (string)$data->FromUserName;
+    log_message("用户取消关注: $openid");
+    return ""; // 无需回复
+}
+
+// 新用户首次关注处理
+function handle_first_subscribe($data) {
+    global $db;
+    $openid = (string)$data->FromUserName;
+    
+    // 初始化用户记录
+    $stmt = $db->prepare("INSERT IGNORE INTO users (openid) VALUES (?)");
+    $stmt->bind_param("s", $openid);
+    $stmt->execute();
+    
+    // 设置状态
+    set_user_state($openid, [
+        'stage' => 'new_user',
+        'step' => 1
+    ]);
+    
+    // 发送欢迎词
+    return "🎉 欢迎关注！请输入您的昵称：";
+}
+
+// 处理新用户昵称
+function handle_new_user($data, &$state) {
+    $content = trim((string)$data->Content);
+    $openid = (string)$data->FromUserName;
+    
+    if (!empty($content)) {
+        // 更新数据库
+        $nickname = substr($content, 0, 20);
+        $stmt = $db->prepare("UPDATE users SET nickname=? WHERE openid=?");
+        $stmt->bind_param("ss", $nickname, $openid);
+        $stmt->execute();
+        
+        // 设置状态
+        $state['stage'] = 'nickname_set';
+        set_user_state($openid, $state);
+        
+        return "✅ 昵称设置成功！请选择频道：\n" . build_channel_menu();
+    }
+    
+    // 错误处理：三次错误后重置
+    if ($state['retry'] >= 2) {
+        cleanup_states($openid);
+        return "输入错误过多，流程已重置。请输入昵称：";
+    }
+    
+    $state['retry'] = ($state['retry'] ?? 0) + 1;
+    set_user_state($openid, $state);
+    
+    return "⚠️ 请输入昵称：";
+}
+
+// 处理频道选择
+function handle_channel_selection($data, &$state) {
+    $content = trim((string)$data->Content);
+    $openid = (string)$data->FromUserName;
+    
+    if (preg_match('/^[1-6]$/', $content)) {
+        // 保存频道选择
+        $state['channel'] = 'ch'.$content;
+        $state['stage'] = 'active_user';
+        set_user_state($openid, $state);
+        
+        // 发送频道规则
+        $rules = get_channel_rules($state['channel']);
+        return "✅ 频道选择成功！\n" . $rules;
+    }
+    
+    // 错误处理：三次错误后重置
+    if ($state['retry'] >= 2) {
+        cleanup_states($openid);
+        return "输入错误过多，流程已重置。请选择频道：\n" . build_channel_menu();
+    }
+    
+    $state['retry'] = ($state['retry'] ?? 0) + 1;
+    set_user_state($openid, $state);
+    
+    return "⚠️ 请输入1-6选择频道：\n" . build_channel_menu();
+}
+
+// 构建频道选择菜单
+function build_channel_menu() {
+    global $db;
+    $channels = $db->query("SELECT channel_code, channel_name FROM channels")->fetch_all(MYSQLI_ASSOC);
+    
+    $menu = "📢 请选择频道：\n";
+    foreach ($channels as $index => $channel) {
+        $num = $index + 1;
+        $menu .= "{$num}. {$channel['channel_name']}\n";
+    }
+    return $menu;
+}
+
+// 获取频道规则
+function get_channel_rules($channel_code) {
+    global $db;
+    $stmt = $db->prepare("SELECT GROUP_CONCAT(rule_content SEPARATOR '\n') AS rules 
+                         FROM channel_rules r 
+                         JOIN channels c ON r.channel_id = c.channel_id 
+                         WHERE c.channel_code = ?");
+    $stmt->bind_param("s", $channel_code);
+    $stmt->execute();
+    $result = $stmt->get_result()->fetch_assoc();
+    
+    return "📜 频道规则：\n" . $result['rules'];
+}
+
+// 状态管理函数
+function get_user_state($openid) {
+    $file = CACHE_DIR.md5($openid).'.state';
+    if (file_exists($file) && (time()-filemtime($file)) < 300) {
+        return json_decode(file_get_contents($file), true);
+    }
+    return ['stage' => 'new_user'];
+}
+
+function set_user_state($openid, $state) {
+    if (!file_exists(CACHE_DIR)) mkdir(CACHE_DIR);
+    $file = CACHE_DIR.md5($openid).'.state';
+    file_put_contents($file, json_encode($state));
+}
+
+function cleanup_states($openid) {
+    $file = CACHE_DIR.md5($openid).'.state';
+    if (file_exists($file)) unlink($file);
+}
+
+// 基础功能函数
+function reply_text($openid, $content) {
+    $xml = "<xml>
+        <ToUserName><![CDATA[$openid]]></ToUserName>
+        <FromUserName><![CDATA[{$GLOBALS['data']->ToUserName}]]></FromUserName>
+        <CreateTime>".time()."</CreateTime>
+        <MsgType><![CDATA[text]]></MsgType>
+        <Content><![CDATA[$content]]></Content>
+    </xml>";
+    echo $xml;
+    log_message("发送回复: " . substr($content, 0, 50));
+}
+
+function log_message($message) {
+    $logFile = date('Y-m-d') . '.log';
+    $logMsg = "[" . date('Y-m-d H:i:s') . "] " . $message . PHP_EOL;
+    file_put_contents($logFile, $logMsg, FILE_APPEND);
+}
+
+// 图片处理示例函数
+function handle_image($user) {
+    reply_text($user['openid'], "🖼️ 已收到图片，正在生成提示词...");
+    log_message("图片处理开始: {$user['openid']}");
+    // 这里可以添加AI图片处理逻辑
+}
+?>
+
+目錄：/hermes/bosnacweb08/bosnacweb08ar/b174/ipg.sweetekconnie46425/line/lineapi/php
+檔名：wechathook2.php
+==================================================
+<?php
+// wechat_webhook.php
+
+require_once 'wechat_config.php';
+require_once 'wechat_database.php';
+require_once 'wechat_functions.php';
+require_once 'wechat_qr_code_functions.php';
+require_once 'wechat_gpt_functions.php';
+require_once 'wechat_utility.php';
+
+date_default_timezone_set("Asia/Shanghai");
+
+// 校验微信服务器的请求
+$token = "WxEqualsecureToken2024";
+$signature = $_GET["signature"] ?? '';
+$timestamp = $_GET["timestamp"] ?? '';
+$nonce = $_GET["nonce"] ?? '';
+$echostr = $_GET["echostr"] ?? '';
+
+$wechat_appid='wx06667787d2417c77';
+$wechat_secret='ed016bba58fa2dcfe961bac782c8b9c0';
+$wechat_access_token='';
+
+$tmpArr = [$token, $timestamp, $nonce];
+sort($tmpArr, SORT_STRING);
+$tmpStr = implode($tmpArr);
+$tmpStr = sha1($tmpStr);
+
+if ($tmpStr == $signature && !empty($echostr)) {
+    echo $echostr;
+    exit;
+}
+
+// 取得 POST 请求内容
+$input = file_get_contents('php://input');
+logme("Received input: " . $input);
+
+// 将 XML 内容解析为对象
+libxml_disable_entity_loader(true); // 安全考量，避免 XML 注入
+$data = simplexml_load_string($input, 'SimpleXMLElement', LIBXML_NOCDATA);
+
+if ($data === false) {
+    logme("Failed to parse XML input");
+    exit;
+}
+
+// 获取消息类型和用户信息
+$msgType = strtolower($data->MsgType);
+$user_id = $data->FromUserName;
+$to_user = $data->ToUserName;
+$createTime = (int) $data->CreateTime; // 当前消息的时间戳
+
+logme("Processing event for user: $user_id");
+
+$messages = [];
+
+// 根据消息类型处理消息
+switch ($msgType) {
+    case "text":
+        $content = trim($data->Content);
+        logme("Received text message: $content");
+
+        // 解析 @help 内容
+        $help_lang = parseHelp($content);
+        if ($help_lang !== null) {
+            // 如果是 @help 请求，返回对应语言的手册内容
+            $reply_content = getUserBookContent($help_lang);
+            logme("Parsed help language: $help_lang");
+            logme("User book content for language $help_lang: $reply_content");
+        } else {
+            // 解析 @code 内容
+            $parsed = parseContent($content);
+            if ($parsed === null) {
+                // 如果未检测到 @code 或 @help，返回原文，并用中英文提示
+                $reply_content = "您发送的消息是 The message you sent is: $content\n";
+            } else {
+                // 生成回复内容
+                $reply_content = generateReplyContent($parsed);
+                logme("Parsed @code content: " . json_encode($parsed));
+            }
+        }
+
+        // 生成回复消息
+        $messages[] = generateTextReply($user_id, $to_user, $reply_content);
+        break;
+
+
+    case "image":	
+		$conn = getDatabaseConnection(); // 获取数据库连接
+		$last_message_time = getLastMessageTime($user_id, $conn);
+		// 判断是否在50秒内收到重复消息
+		if ($last_message_time !== null && ($createTime - $last_message_time < 50)) {
+			logme("Message from $user_id within 50 seconds, skipping duplicate.");
+			quickReply($user_id, $to_user);	
+			exit;
+		}
+		updateLastMessageTime($user_id, $createTime, $conn);
+		$conn->close();
+		
+		//global $replyToken;
+		//$replyToken = $data->MsgId;
+        $image_url = trim($data->PicUrl);
+        logme("Received image with URL: $image_url");
+	imagent_wechat_menu;	
+        // 假设需要下载图片进行进一步处理
+        $image_path = downloadImageFromUrl($image_url);
+		
+        if ($image_path) {
+            logme("Image downloaded successfully: $image_path");
+            $conn = getDatabaseConnection();
+            $profile = getUserProfile($user_id);
+            $wechat_user_name = $profile['nickname'];
+            logme("profile : $profile ");
+
+            updateUserName($conn, $user_id, $wechat_user_name);
+
+            if (isNewUser($conn, $user_id)) {
+                logme("User $user_id is a new user.");				
+				$qr_code_path = saveQRCode($user_id);
+				$modified_image_path = attachQRCodeToImage($image_path, $qr_code_path);
+				$qr_content = "HWAIS-" . $user_id;
+                if (saveNewUserData($conn, $user_id, $wechat_user_name, $qr_content)) {
+					//newuserReply($user_id, $to_user);
+                    // 添加带有 QR Code 的图片
+                    $modified_image_url = $line_image_url_base . $modified_image_path;
+                    logme("New user registered and reply message prepared for user: $user_id");
+					$qr_content = "HWAIS-" . $user_id;
+					if (isValidQRCode($conn, $qr_content, $user_id)) {
+						$quota = hasQuota($conn, $user_id);
+						if ($quota > 0) {
+							$result = askGPT($user_id, $image_path, $qr_content);
+                                                        //$result = askDeepSeek($user_id, $image_path, $qr_content);
+
+							if ($result) {
+								$extracted_data = $result['extracted_data'];
+								$event_code = $result['event_code'];
+								$record_id = $result['record_id'];
+							}
+							if ($extracted_data) {
+								deductQuota($conn, $user_id);
+								$quota = hasQuota($conn, $user_id);
+								logme("Quota after deduction: $quota");
+							} else {
+								$message_text = "抱歉，无法获取 GPT 的回应，请稍后再试。";
+								$messages[] = generateTextReply($user_id, $to_user, $message_text);
+								logme("Failed to get GPT response for user: $user_id");
+							}
+						} else {
+							$message_text = "$wechat_user_name，您的额度已用完，请明天再试或联系管理员。";
+							$messages[] = generateTextReply($user_id, $to_user, $message_text);
+							logme("User quota exhausted for user: $user_id");
+						}
+					} else {
+						$message_text = "$wechat_user_name 无法识别您的图片，再试一次，或更换图片试试!";
+						$messages[] = generateTextReply($user_id, $to_user, $message_text);
+						logme("Invalid QR Code for user: $user_id");
+					}
+                } else {
+                    $message_text = "$wechat_user_name 注册失败，请联系管理员，并告知您的用户 ID：$user_id";
+                    $messages[] = generateTextReply($user_id, $to_user, $message_text);
+                    logme("New user registration failed for user: $user_id");
+                }
+            } else {
+                logme("User $user_id is an existing user.");
+                $qr_content = decodeQRCodeUsingAPI($image_path);
+                $qr_content = "HWAIS-" . $user_id;
+                if ($qr_content == '无法读取二维码') {
+                    logme("No valid QR Code detected for user: $user_id. Automatically adding QR Code.");
+                    $qr_code_path = saveQRCode($user_id);
+                    $modified_image_path = attachQRCodeToImage($image_path, $qr_code_path);
+                    //$image_path = $modified_image_path;
+                    $qr_content = "HWAIS-" . $user_id;
+                }
+                logme("Final QR content: $qr_content");
+                //$image_path = $modified_image_path;
+                if (isValidQRCode($conn, $qr_content, $user_id)) {
+                    $quota = hasQuota($conn, $user_id);
+                    if ($quota > 0) {
+                        $result = askGPT($user_id, $image_path, $qr_content);
+                        // $result = askDeepSeek($user_id, $image_path, $qr_content);
+                        if ($result) {
+                            $extracted_data = $result['extracted_data'];
+                            $event_code = $result['event_code'];
+                            $record_id = $result['record_id'];
+                        }
+
+                        if ($extracted_data) {
+                            deductQuota($conn, $user_id);
+                            $quota = hasQuota($conn, $user_id);
+                            logme("Quota after deduction: $quota");
+                        } else {
+                            $message_text = "抱歉，无法获取 GPT 的回应，请稍后再试。";
+                            $messages[] = generateTextReply($user_id, $to_user, $message_text);
+                            logme("Failed to get GPT response for user: $user_id");
+                        }
+                    } else {
+                        $message_text = "$wechat_user_name，您的额度已用完，请明天再试或联系管理员。";
+                        $messages[] = generateTextReply($user_id, $to_user, $message_text);
+                        logme("User quota exhausted for user: $user_id");
+                    }
+                } else {
+                    $message_text = "$wechat_user_name，无法识别您的图片，再试一次，或更换图片试试。";
+                    $messages[] = generateTextReply($user_id, $to_user, $message_text);
+                    logme("Invalid QR Code for user: $user_id");
+                }
+            }
+
+            $conn->close();
+        } else {
+            $message_text = "抱歉，无法下载您的图片。";
+            $messages[] = generateTextReply($user_id, $to_user, $message_text);
+            logme("Failed to download image for user: $user_id");
+        }
+        break;
+
+    default:
+		$conn = getDatabaseConnection();
+		$profile = getUserProfile($user_id);
+		$wechat_user_name = $profile['nickname'];
+		logme("profile : $profile ");
+		updateUserName($conn, $user_id, $wechat_user_name);
+		if (isNewUser($conn, $user_id)) {
+			logme("User $user_id is a new user. id=$user_id");	
+			$qr_content = "HWAIS-" . $user_id;
+			if (saveNewUserData($conn, $user_id, $wechat_user_name, $qr_content)) {
+				logme("New user registered and reply message prepared for user: $user_id");
+				$message_text1= "您好，欢迎来到AI Magic School 艺术中心\n\n";
+				$message_text1 .= "您的ID是".$user_id."\n\n";
+				$message_text1 .= "请上传一张图片，AI Magic 将为您生成艺术性高的新图片并配上网文，快来试试看吧!";
+				$messages[] = generateTextReply($user_id, $to_user, $message_text1);
+			} else {
+				$message_text = "$wechat_user_name 注册失败，请联系管理员，并告知您的用户 ID：$user_id";
+				$messages[] = generateTextReply($user_id, $to_user, $message_text);
+			}
+		}
+        break;
+}
+
+// 最后回复用户
+sendMessagesToUser($messages);
+
+function sendMessagesToUser($messages) {
+    // 确保响应头只设置一次
+    if (!empty($messages)) {
+        header('Content-Type: text/xml');
+        foreach ($messages as $message) {
+            logme("message to user: $message");
+            echo trim($message);
+        }
+    }
+}
+
+function quickReply($user_id, $to_user) {
+	global $line_image_url_base;
+global $store_url;
+    // 构建消息内容，包含用户查看生成作品的链接
+    $message_text = "您的消息已收到，我们正在处理。\n";
+   // $message_text .= "大约5分钟后，您可以到 " . $line_image_url_base . "wechat_findpost.php?user_id=" . $user_id . " 查寻进度。\n\n";
+    $message_text .= "每次作品生成需等待 5-10 分钟，期间您可以到网站欣赏其他作品。\n\n";
+     $message_text .= "ImAgent专属网站: $store_url\n\n";
+     $message_text .= "在某些情况下，AI可能无法识别您的图片，您可以再试一次，或更换图片试试!\n\n";
+     $message_text .= "请耐心等待，并持续关心本频道，有任何意见，欢迎留言 - ImAgent 艺术推广中心\n\n";
+
+    // 构建微信回复的 XML 消息
+    $response = "<xml>
+                    <ToUserName><![CDATA[$user_id]]></ToUserName>
+                    <FromUserName><![CDATA[$to_user]]></FromUserName>
+                    <CreateTime>" . time() . "</CreateTime>
+                    <MsgType><![CDATA[text]]></MsgType>
+                    <Content><![CDATA[$message_text]]></Content>
+                 </xml>";
+
+    // 输出响应并终止脚本
+    echo $response;
+    exit; // 确保立即返回并终止脚本
+}
+function newuserReply($user_id, $to_user) {
+	global $line_image_url_base;
+	global $store_url;
+    // 构建消息内容，包含用户查看生成作品的链接
+	$message_text = "$wechat_user_name 欢迎您使用 AI Magic，已经为您注册成功！\n\n";
+	$message_text .= "您可免费使用10次服务。\n\n";
+	$message_text .= "完成注册后，需要您再次上传您想要生成的原图片，即可由 AI Magic 生成精彩作品。\n\n";
+	$message_text .= "每次作品生成需等待 5-10 分钟，期间您可以到网站欣赏其他作品。\n\n";
+	$message_text .= "频道专属网站: $store_url\n\n";
+        $message_text .= "在某些情况下，AI可能无法识别您的图片，您可以再试一次，或更换图片试试!\n\n";
+	$message_text .= "请再次上传图片，并持续关心本频道，有任何意见，欢迎留言 - AI Magic 艺术推广中心";
+
+    // 构建微信回复的 XML 消息
+    $response = "<xml>
+                    <ToUserName><![CDATA[$user_id]]></ToUserName>
+                    <FromUserName><![CDATA[$to_user]]></FromUserName>
+                    <CreateTime>" . time() . "</CreateTime>
+                    <MsgType><![CDATA[text]]></MsgType>
+                    <Content><![CDATA[$message_text]]></Content>
+                 </xml>";
+
+    // 输出响应并终止脚本
+    echo $response;
+    //exit; // 确保立即返回并终止脚本
+}
+// 定义解析函数
+function parseContent($content) {
+    // 检查是否以 @code 开头
+    if (strpos($content, "@code") !== 0) {
+        return null; // 如果不是以 @code 开头，返回 null
+    }
+
+    // 去掉 @code 部分，并分解字符串
+    $content = substr($content, 5); // 去掉 "@code" 前缀
+    $parts = explode(",", $content);
+
+    // 定义一个数组来存储解析结果
+    $result = [
+        "user_nick_name" => "",
+        "artist_name" => "",
+        "model_name" => "",
+        "art_style" => "",
+        "category_name" => ""
+    ];
+
+    foreach ($parts as $part) {
+        if (strpos($part, "u.") === 0) {
+            $result["user_nick_name"] = substr($part, 2);
+        } elseif (strpos($part, "a.") === 0) {
+            $result["artist_name"] = substr($part, 2);
+        } elseif (strpos($part, "m.") === 0) {
+            $result["model_name"] = substr($part, 2);
+        } elseif (strpos($part, "s.") === 0) {
+            $result["art_style"] = substr($part, 2);
+        } elseif (strpos($part, "c.") === 0) {
+            $result["category_name"] = substr($part, 2);
+        }
+    }
+
+    return $result;
+}
+
+// 定义生成回复内容的函数
+function generateReplyContent($parsed) {
+    $reply_content = "您提供的信息如下：\n";
+    $reply_content .= "The information you provided is as follows:\n";
+    if ($parsed["user_nick_name"]) {
+        $reply_content .= "User Nickname / 用户昵称: " . $parsed["user_nick_name"] . "\n";
+    }
+    if ($parsed["artist_name"]) {
+        $reply_content .= "Artist Name / 艺术家名称: " . $parsed["artist_name"] . "\n";
+    }
+    if ($parsed["model_name"]) {
+        $reply_content .= "Model Name / 模型名称: " . $parsed["model_name"] . "\n";
+    }
+    if ($parsed["art_style"]) {
+        $reply_content .= "Art Style / 艺术风格: " . $parsed["art_style"] . "\n";
+    }
+    if ($parsed["category_name"]) {
+        $reply_content .= "Category Name / 分类名称: " . $parsed["category_name"] . "\n";
+    }
+    return $reply_content;
+}
+
+
+// 定义 @help 解析函数
+function parseHelp($content) {
+    // 检查是否以 @help 开头
+    if (strpos($content, "@help") !== 0) {
+        return null; // 如果不是以 @help 开头，返回 null
+    }
+
+    // 提取参数
+    $content = substr($content, 5); // 去掉 "@help" 前缀
+    $parts = explode(",", $content);
+
+    foreach ($parts as $part) {
+        if (strpos($part, ".") !== false) {
+            list($prefix, $value) = explode(".", $part, 2);
+            return strtolower(trim($value)); // 返回参数值
+        }
+    }
+
+    return null; // 如果没有参数，返回 null
+}
+
+// 定义获取手册内容的函数
+function getUserBookContent($lang) {
+    $filePath = "userbook.txt"; // 手册文件路径
+    if (!file_exists($filePath)) {
+        logme("Error: File not found at path: $filePath");
+        return "File not found.";
+    }
+
+    $content = file_get_contents($filePath); // 读取手册文件
+    logme("File content loaded successfully.");
+
+    // 定义语言标识符
+    $langStart = [
+        "e" => "# English",
+        "c" => "# Simplified Chinese",
+        "t" => "# Traditional Chinese"
+    ];
+
+    $langEnd = "---"; // 每种语言部分的结束标识
+
+    if (!isset($langStart[$lang])) {
+        logme("Error: Invalid language code provided: $lang");
+        return "Invalid language code.";
+    }
+
+    $startMarker = $langStart[$lang];
+    logme("Searching for start marker: $startMarker");
+
+    $startPos = strpos($content, $startMarker); // 找到语言部分的起始位置
+    if ($startPos === false) {
+        logme("Error: Start marker not found for language: $lang");
+        return "Language section not found.";
+    }
+
+    logme("Start marker found at position: $startPos");
+
+    $endPos = strpos($content, $langEnd, $startPos); // 找到语言部分的结束位置
+    if ($endPos === false) {
+        logme("Error: End marker not found for language: $lang");
+        return "Language section is incomplete.";
+    }
+
+    logme("End marker found at position: $endPos");
+
+    $langContent = substr($content, $startPos, $endPos - $startPos); // 提取内容
+    return trim($langContent); // 返回并去除多余空白
+}
+
+?>
+
+
+目錄：/hermes/bosnacweb08/bosnacweb08ar/b174/ipg.sweetekconnie46425/line/lineapi/php
+檔名：wechat_functions.php
+==================================================
+<?php
+// wechat_functions.php
+
+require_once 'wechat_config.php';
+require_once 'wechat_utility.php';
+
+// 生成文本回复
+function generateTextReply($to_user, $from_user, $content) {
+    return "<xml>
+                <ToUserName><![CDATA[$to_user]]></ToUserName>
+                <FromUserName><![CDATA[$from_user]]></FromUserName>
+                <CreateTime>" . time() . "</CreateTime>
+                <MsgType><![CDATA[text]]></MsgType>
+                <Content><![CDATA[$content]]></Content>
+            </xml>";
+}
+
+// 生成圖片回复
+function generateImageReply($to_user, $from_user, $image_url) {
+    return "<xml>
+                <ToUserName><![CDATA[$to_user]]></ToUserName>
+                <FromUserName><![CDATA[$from_user]]></FromUserName>
+                <CreateTime>" . time() . "</CreateTime>
+                <MsgType><![CDATA[image]]></MsgType>
+                <Image>
+                    <MediaId><![CDATA[$image_url]]></MediaId>
+                </Image>
+            </xml>";
+}
+
+function downloadImageFromUrl($image_url) {
+    // 目标保存路径（你需要修改此路径以符合你的服务器配置）
+
+    $save_dir = 'images/';
+    if (!is_dir($save_dir)) {
+        mkdir($save_dir, 0755, true);
+    }
+ logme("Image downloading to: " . $file_path);
+    // 生成唯一的文件名
+    $file_name = uniqid() . '.jpg';
+    $file_path = $save_dir . $file_name;
+ logme("Image downloading to: " . $file_path);
+    // 使用 curl 下载图片
+    $ch = curl_init($image_url);
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false); // 如果图片的 URL 是 https
+    $image_data = curl_exec($ch);
+
+    if (curl_errno($ch)) {
+        logme("Curl error: " . curl_error($ch));
+        curl_close($ch);
+        return false;
+    }
+
+    curl_close($ch);
+
+    // 检查是否成功获取到图片数据
+    if ($image_data === false) {
+        logme("Failed to download image from URL: " . $image_url);
+        return false;
+    }
+
+    // 保存图片
+    if (file_put_contents($file_path, $image_data) === false) {
+        logme("Failed to save image to file: " . $file_path);
+        return false;
+    }
+
+    logme("Image downloaded and saved to: " . $file_path);
+    return $file_path;
+}
+// 获取用户信息（在微信公众号中需要用户授权才能获取更多信息）
+function getUserProfile($user_id) {
+    global $wechat_access_token;
+    ensureAccessToken();
+    $url = "https://api.weixin.qq.com/cgi-bin/user/info?access_token=$wechat_access_token&openid=$user_id&lang=zh_CN";
+
+    $ch = curl_init($url);
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    $response = curl_exec($ch);
+
+    if (curl_errno($ch)) {
+        logme("Get user profile failed: " . curl_error($ch));
+        curl_close($ch);
+        return null;
+    }
+
+    curl_close($ch);
+
+    $profile = json_decode($response, true);
+
+    if (json_last_error() !== JSON_ERROR_NONE) {
+        logme("Failed to decode user profile JSON: " . json_last_error_msg());
+        return null;
+    }
+
+    // Check for API error response and retry if access token is invalid
+    if (isset($profile['errcode'])) {
+        if ($profile['errcode'] == 40001) {
+            logme("Invalid access token. Refreshing token...");
+            refreshAccessToken();
+            return getUserProfile($user_id);
+        } else {
+            logme("WeChat API Error: " . $profile['errcode'] . " - " . $profile['errmsg']);
+            return null;
+        }
+    }
+
+    // Check if the user is subscribed
+    if (empty($profile['nickname'])) {
+        logme("Nickname is empty. Subscribe status: " . ($profile['subscribe'] ?? 'Unknown'));
+        if (isset($profile['subscribe']) && $profile['subscribe'] == 0) {
+            logme("User is not subscribed. Cannot retrieve full profile.");
+        }
+    }
+
+    logme("User profile retrieved: " . json_encode($profile, JSON_UNESCAPED_UNICODE));
+
+    return [
+        'subscribe' => $profile['subscribe'] ?? 0,
+        'openid' => $profile['openid'] ?? '',
+        'nickname' => $profile['nickname'] ?? '',
+        'sex' => $profile['sex'] ?? 0,
+        'language' => $profile['language'] ?? '',
+        'city' => $profile['city'] ?? '',
+        'province' => $profile['province'] ?? '',
+        'country' => $profile['country'] ?? '',
+        'headimgurl' => $profile['headimgurl'] ?? '',
+        'subscribe_time' => $profile['subscribe_time'] ?? 0,
+        'remark' => $profile['remark'] ?? '',
+        'groupid' => $profile['groupid'] ?? 0,
+        'tagid_list' => $profile['tagid_list'] ?? [],
+        'subscribe_scene' => $profile['subscribe_scene'] ?? '',
+        'qr_scene' => $profile['qr_scene'] ?? 0,
+        'qr_scene_str' => $profile['qr_scene_str'] ?? ''
+    ];
+}
+
+// 确保 access token 有效
+function ensureAccessToken() {
+    global $wechat_access_token;
+    if (empty($wechat_access_token)) {
+        refreshAccessToken();
+    }
+}
+
+// 刷新 access token
+function refreshAccessToken() {
+    global $wechat_appid, $wechat_secret, $wechat_access_token;
+    $url = "https://api.weixin.qq.com/cgi-bin/token?grant_type=client_credential&appid=$wechat_appid&secret=$wechat_secret";
+
+    $ch = curl_init($url);
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    $response = curl_exec($ch);
+
+    if (curl_errno($ch)) {
+        logme("Refresh access token failed: " . curl_error($ch));
+        curl_close($ch);
+        return;
+    }
+
+    curl_close($ch);
+
+    $result = json_decode($response, true);
+
+    if (json_last_error() !== JSON_ERROR_NONE) {
+        logme("Failed to decode access token JSON: " . json_last_error_msg());
+        return;
+    }
+
+    if (isset($result['access_token'])) {
+        $wechat_access_token = $result['access_token'];
+        logme("Access token refreshed successfully.");
+    } else {
+        logme("Failed to refresh access token: " . $response);
+    }
+}
+
+function getAccessToken() {
+    global $wechat_appid, $wechat_secret;
+    $url = "https://api.weixin.qq.com/cgi-bin/token?grant_type=client_credential&appid=" . wechat_appid. "&secret=" . wechat_secret;
+    $response = file_get_contents($url);
+    $response = json_decode($response, true);
+
+    if (isset($response['access_token'])) {
+        return $response['access_token'];
+    } else {
+        error_log("Failed to get access token: " . json_encode($response));
+        return null;
+    }
+}
+
+function createCustomMenu($access_token) {
+global $access_token;
+    $menu_data = json_encode([
+        "button" => [
+            [
+                "name" => "Create Art",
+                "sub_button" => [
+                    ["type" => "click", "name" => "Generate Image", "key" => "GENERATE_IMAGE"],
+                    ["type" => "click", "name" => "Art Styles", "key" => "ART_STYLES"],
+                    ["type" => "click", "name" => "Inspiration Gallery", "key" => "INSPIRATION_GALLERY"]
+                ]
+            ],
+            [
+                "name" => "My Gallery",
+                "sub_button" => [
+                    ["type" => "click", "name" => "My Creations", "key" => "MY_CREATIONS"],
+                    ["type" => "click", "name" => "Favorites", "key" => "FAVORITES"],
+                    ["type" => "click", "name" => "Share Art", "key" => "SHARE_ART"]
+                ]
+            ],
+            [
+                "name" => "Help & Settings",
+                "sub_button" => [
+                    ["type" => "click", "name" => "Tutorials", "key" => "TUTORIALS"],
+                    ["type" => "click", "name" => "Account Settings", "key" => "ACCOUNT_SETTINGS"],
+                    ["type" => "click", "name" => "Contact Support", "key" => "CONTACT_SUPPORT"]
+                ]
+            ]
+        ]
+    ]);
+
+    $url = "https://api.weixin.qq.com/cgi-bin/menu/create?access_token=" . $access_token;
+    $ch = curl_init($url);
+    curl_setopt($ch, CURLOPT_POST, true);
+    curl_setopt($ch, CURLOPT_POSTFIELDS, $menu_data);
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+
+    $response = curl_exec($ch);
+    curl_close($ch);
+
+    $result = json_decode($response, true);
+
+    if ($result['errcode'] == 0) {
+       // echo "Menu created successfully.";
+ logme(" Menu created successfully. for access_token=: $access_token");
+    } else {
+      //  echo "Failed to create menu: " . json_encode($result);
+ logme(" Failed to create menu for access_token=: $access_token");
+    }
+}
+function imagent_wechat_menu(){
+    global $access_token;
+    $access_token = getAccessToken();
+    if ($access_token) {
+        logme(" createCustomMenu for access_token=: $access_token");
+        createCustomMenu($access_token);
+    }
+}
+?>
+
+
+目錄：/hermes/bosnacweb08/bosnacweb08ar/b174/ipg.sweetekconnie46425/line/lineapi/php
+檔名：wechat_utility.php
+==================================================
+<?php
+// utility.php
+
+// 日誌記錄函數
+function logme($message) {
+    // 定義日誌檔的路徑
+    $log_file = 'wechat_webhook.log';
+
+    // 格式化消息，添加時間戳
+    date_default_timezone_set("Asia/Shanghai");
+    $formatted_message = "[" . date("Y-m-d H:i:s") . "] " . $message . "\n";
+
+    // 確保使用 UTF-8 編碼寫入檔
+    file_put_contents($log_file, $formatted_message, FILE_APPEND | LOCK_EX);
+}
+?>
+
+
+目錄：/hermes/bosnacweb08/bosnacweb08ar/b174/ipg.sweetekconnie46425/line/lineapi/php
+檔名：wechat_gpt_functions.php
+==================================================
+
+<?php
+// gpt_functions.php
+
+require_once 'wechat_config.php';
+require_once 'wechat_utility.php';
+require_once 'wechat_database.php'; // 添加此行以获取数据库连接
+
+// 调用 GPT-4 API
+function askGPT($user_id, $image_path, $qr_content) {
+    global $line_image_url_base;
+    $image_url = $line_image_url_base . ltrim($image_path, '../');
+
+    // 从数据库获取特别处理过的 GPT 提示
+    $randomPromptData = getRandomPromptData();
+    $question = $randomPromptData['positive_prompt'];
+
+    logme("Using GPT prompt: $question");
+
+    // 调用 GPT-4 API
+    $gpt_response = ask_gpt4($question, $image_url);
+
+    if ($gpt_response) {
+        // 记录原始 GPT-4 回应
+        logme("Raw GPT-4 response: $gpt_response");
+
+        // 提取需要的数据
+		$result = extract_data_from_gpt_output($user_id, $gpt_response);
+		if ($result) {
+			$extracted_data  = $result['response1'];
+			$extracted_data2 = $result['response2'];
+		}	
+        $conn = getDatabaseConnection();
+        global $replyToken;
+//$replytoken='notusedhere';
+        if ($extracted_data !== false) {
+            // 保存 GPT 回应到数据库
+			logme("保存 GPT 回应到数据库111.");
+            $result = saveGptResponseToDatabase($conn, $user_id, $replyToken, $image_path, $image_url, $question, json_encode($extracted_data2, JSON_UNESCAPED_UNICODE), $gpt_response);
+			//$result = extract_data_from_gpt_output($user_id, $gpt_response);
+			if ($result) {
+				$event_code  = $result['event_code'];
+				$record_id = $result['record_id'];
+			}	
+            $conn->close();
+			
+            return ['extracted_data' => $extracted_data, 'extracted_data2' => $extracted_data2, 'event_code' => $event_code, 'record_id' => $record_id];
+			
+        } else {
+            logme("Failed to extract data from GPT response.");
+            // 即使提取失败，也将原始 GPT 回应保存到数据库
+			logme("即使提取失败，也将原始 GPT 回应保存到数据库.");
+            saveGptResponseToDatabase($conn, $user_id, $replyToken, $image_path, $image_url, $question, null, $gpt_response);
+            $conn->close();
+            return null;
+        }
+    } else {
+        logme("Failed to get GPT response.");
+        return null;
+    }
+}
+
+function ask_gpt4($question, $image_url) {
+    global $openai_api_key;
+
+    $url = 'https://api.openai.com/v1/chat/completions';
+
+    $data = [
+        'model' => 'gpt-4o-2024-08-06',
+     'messages' => [
+            [
+                'role' => 'user',
+                'content' => [
+                    [
+                        'type' => 'text',
+                        'text' => $question
+                    ],
+                    [
+                        'type' => 'image_url',
+                        'image_url' => ['url' => $image_url ]
+                    ]
+                ]
+            ]
+        ],
+        'max_tokens' => 2000, // Adjust as needed
+        'temperature' => 0.7 // Adjust as needed
+    ];
+
+    // 使用 JSON_UNESCAPED_UNICODE 确保中文字符不被转义
+    $post_data = json_encode($data, JSON_UNESCAPED_UNICODE);
+
+    logme("Sending request to GPT-4 API with data: $post_data");
+
+    $ch = curl_init($url);
+    curl_setopt($ch, CURLOPT_TIMEOUT, 120);
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    curl_setopt($ch, CURLOPT_HTTPHEADER, [
+        'Content-Type: application/json',
+        'Authorization: Bearer ' . $openai_api_key
+    ]);
+    curl_setopt($ch, CURLOPT_POSTFIELDS, $post_data);
+
+    $response = curl_exec($ch);
+
+    if (curl_errno($ch)) {
+        logme("GPT-4 API call failed: " . curl_error($ch));
+        curl_close($ch);
+        return null;
+    }
+
+    curl_close($ch);
+
+    logme("GPT-4 API raw response: $response");
+
+    $response_data = json_decode($response, true);
+
+    if (json_last_error() !== JSON_ERROR_NONE) {
+        logme("Failed to decode GPT-4 API response JSON: " . json_last_error_msg());
+        return null;
+    }
+
+    if (isset($response_data['choices'][0]['message']['content'])) {
+        $gpt_content = $response_data['choices'][0]['message']['content'];
+        logme("GPT-4 response content: $gpt_content");
+        return $gpt_content;
+    } else {
+        logme("GPT-4 API response error: " . json_encode($response_data, JSON_UNESCAPED_UNICODE));
+        return null;
+    }
+}
+
+// 从 GPT 回应中提取需要的数据
+function extract_data_from_gpt_output($user_id, $gpt_output) {
+    // 记录 GPT 输出
+    logme("Extracting data from GPT output for user: $user_id");
+
+    // 尝试将 GPT 回应解析为 JSON
+    $data = json_decode($gpt_output, true);
+
+    if (json_last_error() === JSON_ERROR_NONE && is_array($data)) {
+        logme("JSON decoded successfully.");
+
+		// 提取第一组数据
+		$creative_title = isset($data['专栏标题']) ? $data['专栏标题'] : '无专栏标题资料';
+		$picture_analysis = isset($data['图片分析']) ? $data['图片分析'] : '无图片分析资料';
+		$creative_inspiration = isset($data['创作灵感']) ? $data['创作灵感'] : '无创作灵感资料';
+
+		// 提取第二组数据
+		$category = isset($data['category']) ? $data['category'] : 'analysis failed';
+		$artist = isset($data['artist']) ? $data['artist'] : 'analysis failed';
+		$style = isset($data['style']) ? $data['style'] : 'analysis failed';
+		$prompt = isset($data['prompt']) ? $data['prompt'] : 'analysis failed';
+
+		logme("Extracted data - 专栏标题: $creative_title, 图片分析: $picture_analysis, 创作灵感: $creative_inspiration");
+		logme("Extracted data - category: $category, artist: $artist, style: $style, prompt: $prompt");
+
+		// 构建两个返回值
+		$response1 = [
+			'专栏标题' => $creative_title,
+			'图片分析' => $picture_analysis,
+			'创作灵感' => $creative_inspiration
+		];
+
+		$response2 = [
+			'category' => $category,
+			'artist' => $artist,
+			'style' => $style,
+			'prompt' => $prompt
+		];
+
+		return ['response1' => $response1, 'response2' => $response2];
+    } else {
+        logme("JSON decode error: " . json_last_error_msg());
+
+        // 尝试从 GPT 回应中提取 JSON 块
+        $pattern = '/\{(?:[^{}]|(?R))*\}/su';
+        preg_match($pattern, $gpt_output, $matches);
+
+        if (!empty($matches)) {
+            $json_string = $matches[0];
+            logme("Extracted JSON string: $json_string");
+            $data = json_decode($json_string, true);
+
+            if (json_last_error() === JSON_ERROR_NONE && is_array($data)) {
+                logme("JSON decoded successfully from extracted string.");
+
+				// 提取第一组数据
+				$creative_title = isset($data['专栏标题']) ? $data['专栏标题'] : '无专栏标题资料';
+				$picture_analysis = isset($data['图片分析']) ? $data['图片分析'] : '无图片分析资料';
+				$creative_inspiration = isset($data['创作灵感']) ? $data['创作灵感'] : '无创作灵感资料';
+
+				// 提取第二组数据
+				$category = isset($data['category']) ? $data['category'] : 'analysis failed';
+				$artist = isset($data['artist']) ? $data['artist'] : 'analysis failed';
+				$style = isset($data['style']) ? $data['style'] : 'analysis failed';
+				$prompt = isset($data['prompt']) ? $data['prompt'] : 'analysis failed';
+
+				logme("Extracted data - 专栏标题: $creative_title, 图片分析: $picture_analysis, 创作灵感: $creative_inspiration");
+				logme("Extracted data - category: $category, artist: $artist, style: $style, prompt: $prompt");
+
+				// 构建两个返回值
+				$response1 = [
+					'专栏标题' => $creative_title,
+					'图片分析' => $picture_analysis,
+					'创作灵感' => $creative_inspiration
+				];
+
+				$response2 = [
+					'category' => $category,
+					'artist' => $artist,
+					'style' => $style,
+					'prompt' => $prompt
+				];
+
+				return ['response1' => $response1, 'response2' => $response2];
+
+            } else {
+                logme("JSON decode error from extracted string: " . json_last_error_msg());
+				//logme("JSON decode error: " . json_last_error_msg());
+				return ['response1' => default_response1(), 'response2' => default_response2()];
+                //return false;
+            }
+        } else {
+			logme("JSON decode error: " . json_last_error_msg());
+			return ['response1' => default_response1(), 'response2' => default_response2()];
+        }
+    }
+}
+
+// 调用 DeepSeek API
+function askDeepSeek($user_id, $image_path, $qr_content) {
+    global $line_image_url_base;
+    $image_url = $line_image_url_base . ltrim($image_path, '../');
+
+    // 从数据库获取特别处理过的提示
+    $randomPromptData = getRandomPromptData();
+    $question = $randomPromptData['positive_prompt'];
+
+    logme("Using DeepSeek prompt: $question");
+
+    // 调用 DeepSeek API
+    $deepseek_response = ask_deepseek($question, $image_url);
+
+    if ($deepseek_response) {
+        // 记录原始 DeepSeek 回应
+        logme("Raw DeepSeek response: $deepseek_response");
+
+        // 提取需要的数据
+        $result = extract_data_from_deepseek_output($user_id, $deepseek_response);
+        if ($result) {
+            $extracted_data  = $result['response1'];
+            $extracted_data2 = $result['response2'];
+        }
+
+        // 获取数据库连接
+        $conn = getDatabaseConnection();
+        global $replyToken;
+
+        if ($extracted_data !== false) {
+            // 保存 DeepSeek 回应到数据库
+            logme("保存 DeepSeek 回应到数据库.");
+           // $result = saveDeepSeekResponseToDatabase($conn, $user_id, $replyToken, $image_path, $image_url, $question, json_encode($extracted_data2, JSON_UNESCAPED_UNICODE), $deepseek_response);
+            $result = saveGptResponseToDatabase($conn, $user_id, $replyToken, $image_path, $image_url, $question, json_encode($extracted_data2, JSON_UNESCAPED_UNICODE), $deepseek_response);
+
+            // 提取额外数据（event_code 和 record_id）
+            if ($result) {
+                $event_code  = $result['event_code'];
+                $record_id = $result['record_id'];
+            }
+
+            // 关闭数据库连接
+            $conn->close();
+
+            // 返回提取的数据和元数据
+            return [
+                'extracted_data' => $extracted_data,
+                'extracted_data2' => $extracted_data2,
+                'event_code' => $event_code,
+                'record_id' => $record_id
+            ];
+        } else {
+            logme("Failed to extract data from DeepSeek response.");
+            // 即使提取失败，也将原始 DeepSeek 回应保存到数据库
+            logme("即使提取失败，也将原始 DeepSeek 回应保存到数据库.");
+            saveDeepSeekResponseToDatabase($conn, $user_id, $replyToken, $image_path, $image_url, $question, null, $deepseek_response);
+            $conn->close();
+            return null;
+        }
+    } else {
+        logme("Failed to get DeepSeek response.");
+        return null;
+    }
+}
+
+// 调用 DeepSeek API
+function ask_deepseek($question, $image_url) {
+    global $deepseek_api_key;
+
+    // DeepSeek API endpoint
+    $url = 'https://api.deepseek.com/v1/chat/completions';
+
+    // Prepare the request data
+    $data = [
+        'model' => 'deepseek-chat', // Replace with the appropriate DeepSeek model
+        'messages' => [
+            [
+                'role' => 'user',
+                'content' => $question . "\n\nImage URL: " . $image_url // Combine text and image URL
+            ]
+        ],
+        'max_tokens' => 2000, // Adjust as needed
+        'temperature' => 0.7 // Adjust as needed
+    ];
+
+    // Convert the data to JSON
+    $post_data = json_encode($data, JSON_UNESCAPED_UNICODE);
+
+    logme("Sending request to DeepSeek API with data: $post_data");
+
+    // Initialize cURL
+    $ch = curl_init($url);
+    curl_setopt($ch, CURLOPT_TIMEOUT, 120);
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    curl_setopt($ch, CURLOPT_HTTPHEADER, [
+        'Content-Type: application/json',
+        'Authorization: Bearer ' . $deepseek_api_key
+    ]);
+    curl_setopt($ch, CURLOPT_POSTFIELDS, $post_data);
+
+    // Execute the request
+    $response = curl_exec($ch);
+
+    // Check for cURL errors
+    if (curl_errno($ch)) {
+        logme("DeepSeek API call failed: " . curl_error($ch));
+        curl_close($ch);
+        return null;
+    }
+
+    // Close cURL
+    curl_close($ch);
+
+    logme("DeepSeek API raw response: $response");
+
+    // Decode the JSON response
+    $response_data = json_decode($response, true);
+
+    // Check for JSON decoding errors
+    if (json_last_error() !== JSON_ERROR_NONE) {
+        logme("Failed to decode DeepSeek API response JSON: " . json_last_error_msg());
+        return null;
+    }
+
+    // Extract and return the content from the response
+    if (isset($response_data['choices'][0]['message']['content'])) {
+        $deepseek_content = $response_data['choices'][0]['message']['content'];
+        logme("DeepSeek response content: $deepseek_content");
+        return $deepseek_content;
+    } else {
+        logme("DeepSeek API response error: " . json_encode($response_data, JSON_UNESCAPED_UNICODE));
+        return null;
+    }
+}
+
+// 从 DeepSeek 回应中提取需要的数据
+function extract_data_from_deepseek_output($user_id, $deepseek_output) {
+    // Log the DeepSeek output
+    logme("Extracting data from DeepSeek output for user: $user_id");
+
+    // Remove triple backticks and 'json' prefix if present
+    $cleaned_output = preg_replace('/^```json\s*/', '', $deepseek_output); // Remove leading ```json
+    $cleaned_output = preg_replace('/\s*```$/', '', $cleaned_output); // Remove trailing ```
+
+    // Attempt to decode the cleaned JSON
+    $data = json_decode($cleaned_output, true);
+
+    if (json_last_error() === JSON_ERROR_NONE && is_array($data)) {
+        logme("JSON decoded successfully.");
+
+        // Extract the first set of data
+        $creative_title = isset($data['专栏标题']) ? $data['专栏标题'] : '无专栏标题资料';
+        $picture_analysis = isset($data['图片分析']) ? $data['图片分析'] : '无图片分析资料';
+        $creative_inspiration = isset($data['创作灵感']) ? $data['创作灵感'] : '无创作灵感资料';
+
+        // Extract the second set of data
+        $category = isset($data['category']) ? $data['category'] : 'analysis failed';
+        $artist = isset($data['artist']) ? $data['artist'] : 'analysis failed';
+        $style = isset($data['style']) ? $data['style'] : 'analysis failed';
+        $prompt = isset($data['prompt']) ? $data['prompt'] : 'analysis failed';
+
+        logme("Extracted data - 专栏标题: $creative_title, 图片分析: $picture_analysis, 创作灵感: $creative_inspiration");
+        logme("Extracted data - category: $category, artist: $artist, style: $style, prompt: $prompt");
+
+        // Build the two return values
+        $response1 = [
+            '专栏标题' => $creative_title,
+            '图片分析' => $picture_analysis,
+            '创作灵感' => $creative_inspiration
+        ];
+
+        $response2 = [
+            'category' => $category,
+            'artist' => $artist,
+            'style' => $style,
+            'prompt' => $prompt
+        ];
+
+        return ['response1' => $response1, 'response2' => $response2];
+    } else {
+        logme("JSON decode error: " . json_last_error_msg());
+        return ['response1' => default_response1(), 'response2' => default_response2()];
+    }
+}
+
+// 保存 DeepSeek 回应到数据库
+function saveDeepSeekResponseToDatabase($conn, $user_id, $replyToken, $image_path, $image_url, $question, $extracted_data2, $deepseek_response) {
+    // 示例：将响应保存到数据库
+    $query = "INSERT INTO deepseek_responses (user_id, reply_token, image_path, image_url, question, extracted_data2, response) VALUES (?, ?, ?, ?, ?, ?, ?)";
+    $stmt = $conn->prepare($query);
+    $stmt->bind_param("sssssss", $user_id, $replyToken, $image_path, $image_url, $question, $extracted_data2, $deepseek_response);
+
+    if ($stmt->execute()) {
+        return [
+            'event_code' => 'SUCCESS', // 替换为实际的事件代码
+            'record_id' => $stmt->insert_id
+        ];
+    } else {
+        logme("Failed to save DeepSeek response to database: " . $stmt->error);
+        return null;
+    }
+}
+
+
+function default_response1() {
+    return [
+        '专栏标题' => '无专栏标题资料',
+        '图片分析' => '无图片分析资料',
+        '创作灵感' => '无创作灵感资料'
+    ];
+}
+
+function default_response2() {
+    return [
+        'category' => 'analysis failed',
+        'artist' => 'analysis failed',
+        'style' => 'analysis failed',
+        'prompt' => 'analysis failed'
+    ];
+}
+
+// 从数据库获取特别处理过的 GPT 提示
+function getRandomPromptData() {
+    $conn = getDatabaseConnection();
+    $sql = "SELECT * FROM prompt_data WHERE status = 'active' ORDER BY RAND() LIMIT 1";
+    $result = $conn->query($sql);
+
+    if ($result && $result->num_rows > 0) {
+        $promptData = $result->fetch_assoc();
+        logme("Random prompt data retrieved: " . json_encode($promptData, JSON_UNESCAPED_UNICODE));
+        $conn->close();
+        return $promptData;
+    } else {
+        logme("No prompt data found.");
+        $conn->close();
+        return null;
+    }
+}
+?>
+
+
+目錄：/hermes/bosnacweb08/bosnacweb08ar/b174/ipg.sweetekconnie46425/line/lineapi/php
+檔名：wechat_database.php
+==================================================
+<?php
+// database.php
+
+require_once 'wechat_config.php';
+require_once 'wechat_utility.php';
+date_default_timezone_set("Asia/Shanghai");
+
+// 建立数据库连接
+function getDatabaseConnection() {
+    global $db_host, $db_user, $db_password, $db_name;
+
+    $conn = new mysqli($db_host, $db_user, $db_password, $db_name);
+
+    if ($conn->connect_error) {
+        logme("数据库连接失败: " . $conn->connect_error);
+        die("数据库连接失败: " . $conn->connect_error);
+    }
+
+    // 设置字符集
+    if (!$conn->set_charset("utf8mb4")) {
+        logme("Error loading character set utf8mb4: " . $conn->error);
+        exit();
+    }
+
+    return $conn;
+}
+
+// 判断是否为新用户
+function isNewUser($conn, $user_id) {
+    $stmt = $conn->prepare("SELECT user_id FROM user_data WHERE user_id = ?");
+    $stmt->bind_param('s', $user_id);
+    $stmt->execute();
+    $stmt->store_result();
+
+    $is_new_user = $stmt->num_rows === 0;
+    logme("isNewUser for user_id $user_id: " . ($is_new_user ? "Yes" : "No"));
+
+    $stmt->close();
+    return $is_new_user;
+}
+
+// 保存新用户数据
+function saveNewUserData($conn, $user_id, $line_user_name, $qr_content) {
+    date_default_timezone_set('Asia/Shanghai');
+    $current_time = date('Y-m-d H:i:s');  // 获取当前北京时间字符串
+
+    // 准备 SQL 插入语句，使用 ? 作为占位符
+    $stmt = $conn->prepare("INSERT INTO user_data (user_id, user_name, status, daily_quota, remaining_quota, balance, qr_content, last_reset_date, created_at) 
+                            VALUES (?, ?, 'active', 20, 20, 0.00, ?, CURDATE(), ?)");
+    
+    // 绑定参数，其中 $current_time 是 created_at 的值
+    $stmt->bind_param('ssss', $user_id, $line_user_name, $qr_content, $current_time);
+
+    if ($stmt->execute()) {
+        logme("新用户数据保存成功: $user_id");
+        $stmt->close();
+        return true;
+    } else {
+        logme("新用户数据保存失败: " . $stmt->error);
+        $stmt->close();
+        return false;
+    }
+}
+
+// 检查用户配额
+function hasQuota($conn, $user_id) {
+    $stmt = $conn->prepare("SELECT remaining_quota FROM user_data WHERE user_id = ?");
+    $stmt->bind_param('s', $user_id);
+    $stmt->execute();
+    $stmt->bind_result($remaining_quota);
+    $stmt->fetch();
+    $stmt->close();
+
+    logme("User $user_id has remaining quota: $remaining_quota");
+    return $remaining_quota;
+}
+
+// 扣除用户配额
+function deductQuota($conn, $user_id) {
+    $stmt = $conn->prepare("UPDATE user_data SET remaining_quota = remaining_quota - 1 WHERE user_id = ? AND remaining_quota > 0");
+    $stmt->bind_param('s', $user_id);
+    if ($stmt->execute()) {
+        logme("用户配额扣除成功: $user_id");
+    } else {
+        logme("用户配额扣除失败: " . $stmt->error);
+    }
+    $stmt->close();
+}
+
+// 更新用户名
+function updateUserName($conn, $user_id, $line_user_name) {
+    $stmt = $conn->prepare("UPDATE user_data SET user_name = ? WHERE user_id = ?");
+    $stmt->bind_param('ss', $line_user_name, $user_id);
+    if ($stmt->execute()) {
+        logme("用户名更新成功: $user_id");
+    } else {
+        logme("用户名更新失败: " . $stmt->error);
+    }
+    $stmt->close();
+}
+
+// 检查 QR Code 是否有效
+function isValidQRCode($conn, $qr_content, $user_id) {
+    $stmt = $conn->prepare("SELECT qr_content FROM user_data WHERE user_id = ? AND ? LIKE CONCAT(qr_content, '%')");
+    $stmt->bind_param('ss', $user_id, $qr_content);
+    $stmt->execute();
+    $stmt->store_result();
+
+    $is_valid = $stmt->num_rows > 0;
+    logme("isValidQRCode for user_id $user_id: " . ($is_valid ? "Yes" : "No"));
+
+    $stmt->close();
+    return $is_valid;
+}
+
+// 保存 QR Code 结果到数据库
+function saveQRCodeResult($conn, $user_id, $image_path, $qr_content) {
+    $stmt = $conn->prepare("INSERT INTO qr_results (line_user_id, image_path, qr_content) VALUES (?, ?, ?)");
+    $stmt->bind_param('sss', $user_id, $image_path, $qr_content);
+
+    if ($stmt->execute()) {
+        logme("QR Code 结果保存成功: $user_id");
+    } else {
+        logme("QR Code 结果保存失败: " . $stmt->error);
+    }
+    $stmt->close();
+}
+
+
+function saveGptResponseToDatabase($conn, $user_id, $replyToken, $image_path, $image_url, $gpt_question, $gpt_prompt_json, $gpt_ans) {
+    // 获取可用的机器 ID
+    $task_machine_uuid = getAvailableMachine($conn);
+    $q_date = date('Y-m-d H:i:s');
+
+    // 组合 user_id, image_url, q_date 生成唯一码
+    $unique_string = $user_id . $image_url . $q_date;
+    $event_code = hash('md5', $unique_string); // 使用 MD5 生成哈希码
+
+    // 准备 SQL 语句
+    $stmt = $conn->prepare("INSERT INTO gpt_responses (user_id, replytoken, image_path, image_url, gpt_question, gpt_prompt_json, q_date, task_machine_uuid, gpt_ans, event_code) 
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+    $stmt->bind_param('ssssssssss', $user_id, $replyToken, $image_path, $image_url, $gpt_question, $gpt_prompt_json, $q_date, $task_machine_uuid, $gpt_ans, $event_code);
+
+    // 执行插入并检查结果
+    if ($stmt->execute()) {
+        // 取得自动生成的 ID
+        $record_id = $stmt->insert_id;
+        logme("GPT 回应保存成功: $user_id, Record ID: $record_id, Event Code: $event_code");
+		['response1' => $response1, 'response2' => $response2];
+        return ['event_code' => $event_code, 'record_id' => $record_id];  // 回传 $event_code, record_id
+    } else {
+        logme("GPT 回应保存失败: " . $stmt->error);
+        return false;  // 保存失败时回传 false
+    }
+    $stmt->close();
+}
+
+// 获取可用的机器
+function getAvailableMachine2($conn) {
+    $sql = "SELECT machine_id FROM machine_status WHERE switch = 'on' ORDER BY RAND() LIMIT 1";
+    $result = $conn->query($sql);
+
+    if ($result && $result->num_rows > 0) {
+        $row = $result->fetch_assoc();
+        $machine_id = $row['machine_id'];
+        logme("Available machine found: $machine_id");
+        return $machine_id;
+    } else {
+        logme("No available machine found");
+        return null;
+    }
+}
+
+function getAvailableMachine($conn) {
+    // First priority: switch = 'on', status = 'idle', and timestamp within 120 seconds, sorted by longest time difference
+   date_default_timezone_set('Asia/Shanghai');
+    $sql = "SELECT machine_id 
+            FROM machine_status 
+            WHERE switch = 'on' 
+              AND status = 'idle' 
+              AND TIMESTAMPDIFF(SECOND, timestamp, NOW()) <= 120 
+            ORDER BY TIMESTAMPDIFF(SECOND, timestamp, NOW()) DESC 
+            LIMIT 1";
+    $result = $conn->query($sql);
+    
+    if ($result && $result->num_rows > 0) {
+        $row = $result->fetch_assoc();
+        $machine_id = $row['machine_id'];
+        logme("Available machine found with status 'idle': $machine_id");
+        return $machine_id;
+    }
+    
+    // Second priority: switch = 'on', status = 'online', and timestamp within 120 seconds, sorted by longest time difference
+    $sql = "SELECT machine_id 
+            FROM machine_status 
+            WHERE switch = 'on' 
+              AND status = 'online' 
+              AND TIMESTAMPDIFF(SECOND, timestamp, NOW()) <= 120 
+            ORDER BY TIMESTAMPDIFF(SECOND, timestamp, NOW()) DESC 
+            LIMIT 1";
+    $result = $conn->query($sql);
+    
+    if ($result && $result->num_rows > 0) {
+        $row = $result->fetch_assoc();
+        $machine_id = $row['machine_id'];
+        logme("Available machine found with status 'online': $machine_id");
+        return $machine_id;
+    }
+    
+    // Third priority: switch = 'on' and timestamp within 500 seconds, sorted by longest time difference
+    $sql = "SELECT machine_id 
+            FROM machine_status 
+            WHERE switch = 'on' 
+              AND TIMESTAMPDIFF(SECOND, timestamp, NOW()) <= 500 
+            ORDER BY TIMESTAMPDIFF(SECOND, timestamp, NOW()) DESC 
+            LIMIT 1";
+    $result = $conn->query($sql);
+    
+    if ($result && $result->num_rows > 0) {
+        $row = $result->fetch_assoc();
+        $machine_id = $row['machine_id'];
+        logme("Available machine found within 500 seconds: $machine_id");
+        return $machine_id;
+    }
+    
+    // If no machine is found within the specified conditions, log an error
+    logme("No available machine found with the specified conditions");
+    return null;
+}
+
+
+// 获取用户的 last_message_time
+function getLastMessageTime($user_id, $conn) {
+    $sql = "SELECT last_message_time FROM user_data WHERE user_id = ?";
+    $stmt = $conn->prepare($sql);
+    $stmt->bind_param('s', $user_id);
+    $stmt->execute();
+    $result = $stmt->get_result();
+
+    if ($result->num_rows > 0) {
+        $row = $result->fetch_assoc();
+        return strtotime($row['last_message_time']); // 返回时间戳
+    } else {
+        return null; // 用户不存在，返回 null
+    }
+}
+
+// 更新用户的 last_message_time
+function updateLastMessageTime($user_id, $createTime, $conn) {
+    // 将 $createTime 转换为日期时间格式
+    $current_time = date('Y-m-d H:i:s', $createTime);
+
+    // 更新 SQL 语句，设置 last_message_time 和 updated_at 为相同的时间
+    $sql = "UPDATE user_data SET last_message_time = ?, updated_at = ? WHERE user_id = ?";
+    $stmt = $conn->prepare($sql);
+
+    // 绑定参数，$current_time 用于 last_message_time 和 updated_at
+    $stmt->bind_param('sss', $current_time, $current_time, $user_id);
+
+    // 执行更新并关闭语句
+    $stmt->execute();
+    $stmt->close();
+}
+?>
+
+
+目錄：/hermes/bosnacweb08/bosnacweb08ar/b174/ipg.sweetekconnie46425/line/lineapi/php
+檔名：wechat_config.php
+==================================================
+<?php
+// wechat_config.php
+//$openai_api_key = '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';
+
+$openai_api_key = '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';
+
+$deepseek_api_key = 'sk-fe512d27970949e2b66fc08635e5dde9';
+
+// WeChat API Keys
+//$wechat_app_id = 'wxb60e32f6dcaa5d3b';
+//$wechat_app_secret = 'ed016bba58fa2dcfe961bac782c8b9c0';
+//$wechat_token = 'WxEqualsecureToken2024';
+//$wechat_access_token_url = 'https://api.weixin.qq.com/cgi-bin/token';
+//$wechat_message_url = 'https://api.weixin.qq.com/cgi-bin/message/custom/send?access_token=';
+
+// WeChat API Keys
+$wechat_app_id = 'wx06667787d2417c77';
+$wechat_app_secret = 'cc61daf29bc16949ea8756177bdcbe09';
+$wechat_token = 'WxEqualsecureToken2024';
+$wechat_access_token_url = 'https://api.weixin.qq.com/cgi-bin/token';
+$wechat_message_url = 'https://api.weixin.qq.com/cgi-bin/message/custom/send?access_token=';
+
+
+// Database credentials (unchanged)
+$db_host = 'sweetekconnie46425.ipagemysql.com';
+$db_user = 'ericwang';
+$db_password = 'Eric010101)!)!)!';
+$db_name = 'sweetekconnie46_fvdg_qscsxdpmlak';
+
+// URL configurations
+$qr_code_url = 'https://api.qrserver.com/v1/create-qr-code/?size=150x150&data=';
+//$wechat_image_url_base = 'https://api.weixin.qq.com/cgi-bin/media/upload?access_token=';
+$wechat_image_url_base = 'https://line.heatgroups.com/lineapi/php/';
+$line_image_url_base = 'https://line.heatgroups.com/lineapi/php/';
+$store_url = 'https://imagent.heatgroups.tech/';
+
+// Default prompt
+$default_prompt = 'AI Magic for image generation';
+
+?>
+
+目錄：/hermes/bosnacweb08/bosnacweb08ar/b174/ipg.sweetekconnie46425/line/lineapi/php
+檔名：wechat_findpost.php
+==================================================
+<?php
+// 开始 PHP 脚本
+
+// 禁用缓存的 HTTP 头部信息
+header("Cache-Control: no-store, no-cache, must-revalidate, max-age=0"); // HTTP 1.1.
+header("Pragma: no-cache"); // HTTP 1.0.
+header("Expires: 0"); // 禁止缓存
+date_default_timezone_set("Asia/Shanghai");
+
+// 确保正确获取 user_id 并与数据库进行连接和查询
+if (!isset($_GET['user_id'])) {
+    echo "<p>未提供用户ID。</p>";
+    exit();
+}
+
+$user_id = $_GET['user_id'];
+
+// 确保在 JavaScript 中获取到 PHP 的 $user_id 变量
+$user_id_js = htmlspecialchars($user_id, ENT_QUOTES);
+
+// Database connection
+require_once 'wechat_config.php';
+require_once 'wechat_utility.php';
+
+global $db_host, $db_user, $db_password, $db_name;
+$conn = new mysqli($db_host, $db_user, $db_password, $db_name);
+
+// Check connection
+if ($conn->connect_error) {
+    die("连接失败: " . $conn->connect_error);
+}
+
+// 定义查询语句，查找20条相关的记录，按生成时间排序
+$sql = "
+    SELECT id, q_date, gpt_prompt_json, task_status, article_info
+    FROM gpt_responses
+    WHERE user_id = '$user_id'
+    ORDER BY q_date DESC
+    LIMIT 20
+";
+
+$result = $conn->query($sql);
+?>
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI 生成状态查询</title>
+    
+    <!-- 禁用缓存 -->
+    <meta http-equiv="Cache-Control" content="no-store, no-cache, must-revalidate">
+    <meta http-equiv="Pragma" content="no-cache">
+    <meta http-equiv="Expires" content="0">
+
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+        }
+        table {
+            border-collapse: collapse;
+            width: 100%;
+        }
+        th, td {
+            text-align: left;
+            padding: 12px;
+            font-size: 16px; /* 增大表格文字大小 */
+        }
+        th {
+            background-color: #4CAF50;
+            color: white;
+        }
+        tr:nth-child(even) {
+            background-color: #f2f2f2;
+        }
+        h2 {
+            font-size: 24px;
+        }
+        .notice {
+            color: #FF4500;
+            font-size: 10px;
+            margin-bottom: 10px;
+        }
+    </style>
+
+    <script>
+        // 确保在JavaScript中获取到PHP的user_id变量
+        var userId = '<?php echo $user_id_js; ?>';
+
+        // 使用 JavaScript 每10秒自动刷新页面，并添加时间戳来防止缓存
+        setTimeout(function(){
+            if (userId) {
+                var currentUrl = location.href.split('?')[0] + '?user_id=' + userId + '&t=' + new Date().getTime();
+                window.location.href = currentUrl;
+            } else {
+                console.error('user_id 未定义');
+            }
+        }, 10000); // 每10秒刷新一次
+    </script>
+</head>
+<body>
+
+<h2>最近20笔AI生成状态:</h2>
+<p class="notice">此页面每10秒自动刷新一次。查看生成结果时，反应会稍慢</p>
+
+<?php
+if ($result->num_rows > 0) {
+    // 输出表格头
+    echo "<table border='1' cellpadding='10' cellspacing='0'>
+            <tr>
+                <th>ID</th>
+                <th>生成时间</th>
+                <th>生成状态</th>
+                <th>post no</th>				
+                <th>生成链接</th>
+            </tr>";
+    
+    // 循环输出结果
+    while ($row = $result->fetch_assoc()) {
+        $id = $row['id'];
+        $q_date = $row['q_date'];
+        $gpt_prompt_json = $row['gpt_prompt_json'];
+        $article_info = $row['article_info'];
+        $task_status = $row['task_status'];
+		
+        // 初始化生成状态和链接
+        $status = '';
+        $link = 'N/A';
+
+		// 检查不同状态条件，使用 switch case 语句
+		switch (true) {
+            case is_null($gpt_prompt_json):
+                // AI 尚未处理
+                $status = "AI分析中";
+                break;
+		
+			case $task_status === 'pending':
+				// AI 正在生成，且任务状态为 pending
+				$status = "AI正在生成中";
+				break;
+
+			case $task_status === 'completed' && !is_null($article_info):
+				// AI 已生成，任务状态为 completed，提供链接
+				$status = "AI已生成";
+                                global $store_url; // 声明 global 以访问 $store_url
+				$redirect_url = $store_url . "?p=" . $article_info;
+				$link = "<a href='$redirect_url' target='_blank'>查看生成结果</a>";
+				break;
+
+			case strpos($gpt_prompt_json, 'failed') !== false:
+				// AI 无法分析
+				$status = "AI无法分析图片";
+				break;
+
+			default:
+				// 默认情况，可以处理意外的状态
+				$status = "未知状态";
+				$link = 'N/A';
+				break;
+		}
+
+        // 输出表格行
+        echo "<tr>
+                <td>$id</td>
+                <td>$q_date</td>
+                <td>$status</td>
+                <td>$article_info</td>				
+                <td>$link</td>
+              </tr>";
+    }
+
+    echo "</table>";
+} else {
+    // 如果没有找到记录
+    echo "<p>未找到相关记录。</p>";
+}
+
+$conn->close();
+?>
+
+</body>
+</html>
+
+
+目錄：/hermes/bosnacweb08/bosnacweb08ar/b174/ipg.sweetekconnie46425/line/lineapi/php
+檔名：wechat_qr_code_functions.php
+==================================================
+<?php
+// qr_code_functions.php
+
+require_once 'wechat_config.php';
+require_once 'wechat_utility.php';
+
+// 生成并保存 QR Code
+function saveQRCode($user_id) {
+    global $qr_code_url;
+    $qr_content = "HWAIS-" . $user_id;
+    $qr_url = $qr_code_url . urlencode($qr_content);
+
+    $save_directory = 'qrcodes/';
+    $qr_code_file = $save_directory . $qr_content . '.png';
+
+    if (!file_exists($save_directory)) {
+        mkdir($save_directory, 0755, true);
+    }
+
+    $ch = curl_init($qr_url);
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
+    $qr_code_image = curl_exec($ch);
+
+    if (curl_errno($ch)) {
+        logme("QR Code generation failed: " . curl_error($ch));
+        curl_close($ch);
+        return false;
+    }
+
+    curl_close($ch);
+
+    $result = file_put_contents($qr_code_file, $qr_code_image);
+
+    if ($result === false) {
+        logme("Failed to save QR code image to: $qr_code_file");
+        return false;
+    }
+
+    logme("QR Code generated and saved to: $qr_code_file");
+    return $qr_code_file;
+}
+
+// 将 QR Code 附加到图片
+function attachQRCodeToImage($image_path, $qr_code_path) {
+    // 检测图片类型（JPEG 或 PNG）
+    $image_info = getimagesize($image_path);
+    $image_mime = $image_info['mime'];
+
+    if ($image_mime == 'image/jpeg') {
+        $image = imagecreatefromjpeg($image_path);
+    } elseif ($image_mime == 'image/png') {
+        $image = imagecreatefrompng($image_path);
+    } else {
+        logme("Unsupported image format: $image_mime");
+        return false;
+    }
+
+    $qr_code = imagecreatefrompng($qr_code_path);
+
+    // 调整 QR Code 大小
+    $image_width = imagesx($image);
+    $image_height = imagesy($image);
+    $qr_size = min($image_width, $image_height) / 8;
+
+    $resized_qr = imagecreatetruecolor($qr_size, $qr_size);
+    imagealphablending($resized_qr, false);
+    imagesavealpha($resized_qr, true);
+    imagecopyresampled($resized_qr, $qr_code, 0, 0, 0, 0, $qr_size, $qr_size, imagesx($qr_code), imagesy($qr_code));
+
+    // 将 QR Code 放置在图片右下角
+    $qr_x = $image_width - $qr_size - 10;
+    $qr_y = $image_height - $qr_size - 10;
+
+    imagecopy($image, $resized_qr, $qr_x, $qr_y, 0, 0, $qr_size, $qr_size);
+
+    // 保存修改后的图片
+    $modified_image_path = 'images/modified_' . basename($image_path);
+
+    if ($image_mime == 'image/jpeg') {
+        imagejpeg($image, $modified_image_path);
+    } elseif ($image_mime == 'image/png') {
+        imagepng($image, $modified_image_path);
+    }
+
+    // 释放存储器
+    imagedestroy($image);
+    imagedestroy($resized_qr);
+    imagedestroy($qr_code);
+
+    logme("Image with QR Code saved: $modified_image_path");
+    return $modified_image_path;
+}
+
+// 译码图片中的 QR Code
+function decodeQRCodeUsingAPI($image_path) {
+    $url = 'https://api.qrserver.com/v1/read-qr-code/';
+    $post_data = ['file' => new CURLFile($image_path)];
+
+    $ch = curl_init($url);
+    curl_setopt($ch, CURLOPT_POST, 1);
+    curl_setopt($ch, CURLOPT_POSTFIELDS, $post_data);
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    $response = curl_exec($ch);
+
+    if (curl_errno($ch)) {
+        logme("QR Code decoding failed: " . curl_error($ch));
+        curl_close($ch);
+        return "无法读取二维码";
+    }
+
+    curl_close($ch);
+
+    $result = json_decode($response, true);
+
+    if (json_last_error() !== JSON_ERROR_NONE) {
+        logme("Failed to decode QR code JSON: " . json_last_error_msg());
+        return "无法读取二维码";
+    }
+
+    if (isset($result[0]['symbol'][0]['data'])) {
+        $qr_content = $result[0]['symbol'][0]['data'];
+        logme("QR Code decoded: $qr_content");
+        return $qr_content;
+    } else {
+        logme("QR Code decoding failed: No data found");
+        return "无法读取二维码";
+    }
+}
+?>
+
+
+目錄：/hermes/bosnacweb08/bosnacweb08ar/b174/ipg.sweetekconnie46425/line/lineapi/php
+檔名：findpost_new.php
+==================================================
+<?php
+// 开始 PHP 脚本
+
+// 禁用缓存的 HTTP 头部信息
+header("Cache-Control: no-store, no-cache, must-revalidate, max-age=0"); // HTTP 1.1.
+header("Pragma: no-cache"); // HTTP 1.0.
+header("Expires: 0"); // 禁止缓存
+
+// 确保正确获取 user_id 并与数据库进行连接和查询
+if (!isset($_GET['user_id'])) {
+    echo "<p>未提供用户ID。</p>";
+    exit();
+}
+
+$user_id = $_GET['user_id'];
+
+// 确保在 JavaScript 中获取到 PHP 的 $user_id 变量
+$user_id_js = htmlspecialchars($user_id, ENT_QUOTES);
+
+// Database connection
+require_once 'config.php';
+require_once 'utility.php';
+
+global $db_host, $db_user, $db_password, $db_name;
+$conn = new mysqli($db_host, $db_user, $db_password, $db_name);
+
+// Check connection
+if ($conn->connect_error) {
+    die("连接失败: " . $conn->connect_error);
+}
+
+// 定义查询语句，查找20条相关的记录，按生成时间排序
+$sql = "
+    SELECT id, q_date, gpt_prompt_json, task_status, article_info
+    FROM gpt_responses
+    WHERE user_id = '$user_id'
+    ORDER BY q_date DESC
+    LIMIT 20
+";
+
+$result = $conn->query($sql);
+?>
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI 生成状态查询</title>
+    
+    <!-- 禁用缓存 -->
+    <meta http-equiv="Cache-Control" content="no-store, no-cache, must-revalidate">
+    <meta http-equiv="Pragma" content="no-cache">
+    <meta http-equiv="Expires" content="0">
+
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+        }
+        table {
+            border-collapse: collapse;
+            width: 100%;
+        }
+        th, td {
+            text-align: left;
+            padding: 12px;
+            font-size: 16px; /* 增大表格文字大小 */
+        }
+        th {
+            background-color: #4CAF50;
+            color: white;
+        }
+        tr:nth-child(even) {
+            background-color: #f2f2f2;
+        }
+        h2 {
+            font-size: 24px;
+        }
+        .notice {
+            color: #FF4500;
+            font-size: 10px;
+            margin-bottom: 10px;
+        }
+    </style>
+
+    <script>
+        // 确保在JavaScript中获取到PHP的user_id变量
+        var userId = '<?php echo $user_id_js; ?>';
+
+        // 使用 JavaScript 每5秒自动刷新页面，并添加时间戳来防止缓存
+        setTimeout(function(){
+            if (userId) {
+                var currentUrl = location.href.split('?')[0] + '?user_id=' + userId + '&t=' + new Date().getTime();
+                window.location.href = currentUrl;
+            } else {
+                console.error('user_id 未定义');
+            }
+        }, 5000); // 每5秒刷新一次
+    </script>
+</head>
+<body>
+
+<h2>最近20笔AI生成状态:</h2>
+<p class="notice">此页面每5秒自动刷新一次。查看生成结果时，反应会稍慢</p>
+
+<?php
+if ($result->num_rows > 0) {
+    // 输出表格头
+    echo "<table border='1' cellpadding='10' cellspacing='0'>
+            <tr>
+                <th>ID</th>
+                <th>生成时间</th>
+                <th>生成状态</th>
+                <th>post no</th>				
+                <th>生成链接</th>
+            </tr>";
+    
+    // 循环输出结果
+    while ($row = $result->fetch_assoc()) {
+        $id = $row['id'];
+        $q_date = $row['q_date'];
+        $gpt_prompt_json = $row['gpt_prompt_json'];
+        $article_info = $row['article_info'];
+        $task_status = $row['task_status'];
+		
+        // 初始化生成状态和链接
+        $status = '';
+        $link = 'N/A';
+
+		// 检查不同状态条件，使用 switch case 语句
+		switch (true) {
+            case is_null($gpt_prompt_json):
+                // AI 尚未处理
+                $status = "AI分析中";
+                break;
+		
+			case $task_status === 'pending':
+				// AI 正在生成，且任务状态为 pending
+				$status = "AI正在生成中";
+				break;
+
+			case $task_status === 'completed' && !is_null($article_info):
+				// AI 已生成，任务状态为 completed，提供链接
+				$status = "AI已生成";
+                                global $store_url; // 声明 global 以访问 $store_url
+				$redirect_url = $store_url . "?p=" . $article_info;
+				$link = "<a href='$redirect_url' target='_blank'>查看生成结果</a>";
+				break;
+
+			case strpos($gpt_prompt_json, 'failed') !== false:
+				// AI 无法分析
+				$status = "AI无法分析图片";
+				break;
+
+			default:
+				// 默认情况，可以处理意外的状态
+				$status = "未知状态";
+				$link = 'N/A';
+				break;
+		}
+
+        // 输出表格行
+        echo "<tr>
+                <td>$id</td>
+                <td>$q_date</td>
+                <td>$status</td>
+                <td>$article_info</td>				
+                <td>$link</td>
+              </tr>";
+    }
+
+    echo "</table>";
+} else {
+    // 如果没有找到记录
+    echo "<p>未找到相关记录。</p>";
+}
+
+$conn->close();
+?>
+
+</body>
+</html>
+
+
+目錄：/hermes/bosnacweb08/bosnacweb08ar/b174/ipg.sweetekconnie46425/line/lineapi/php
+檔名：wechat_config_bk20241107.php
+==================================================
+<?php
+// wechat_config.php
+$openai_api_key = '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';
+
+// WeChat API Keys
+$wechat_app_id = 'wx06667787d2417c77';
+$wechat_app_secret = 'ed016bba58fa2dcfe961bac782c8b9c0';
+$wechat_token = 'WxEqualsecureToken2024';
+$wechat_access_token_url = 'https://api.weixin.qq.com/cgi-bin/token';
+$wechat_message_url = 'https://api.weixin.qq.com/cgi-bin/message/custom/send?access_token=';
+
+// Database credentials (unchanged)
+$db_host = 'sweetekconnie46425.ipagemysql.com';
+$db_user = 'ericwang';
+$db_password = 'Eric010101)!)!)!';
+$db_name = 'sweetekconnie46_fvdg_qscsxdpmlak';
+
+// URL configurations
+$qr_code_url = 'https://api.qrserver.com/v1/create-qr-code/?size=150x150&data=';
+//$wechat_image_url_base = 'https://api.weixin.qq.com/cgi-bin/media/upload?access_token=';
+$wechat_image_url_base = 'https://line.heatgroups.com/lineapi/php/';
+$line_image_url_base = 'https://line.heatgroups.com/lineapi/php/';
+$store_url = 'https://stores.heatgroups.com/';
+
+// Default prompt
+$default_prompt = 'AI Magic for image generation';
+
+?>
+
+目錄：/hermes/bosnacweb08/bosnacweb08ar/b174/ipg.sweetekconnie46425/line/lineapi/php
+檔名：wechathook2_bk20241107.php
+==================================================
+<?php
+// wechat_webhook.php
+
+require_once 'wechat_config.php';
+require_once 'wechat_database.php';
+require_once 'wechat_functions.php';
+require_once 'wechat_qr_code_functions.php';
+require_once 'wechat_gpt_functions.php';
+require_once 'wechat_utility.php';
+
+// 校驗微信伺服器的請求
+$token = "WxEqualsecureToken2024";
+$signature = $_GET["signature"] ?? '';
+$timestamp = $_GET["timestamp"] ?? '';
+$nonce = $_GET["nonce"] ?? '';
+$echostr = $_GET["echostr"] ?? '';
+
+$wechat_appid='wx06667787d2417c77';
+$wechat_secret='ed016bba58fa2dcfe961bac782c8b9c0';
+$wechat_access_token='';
+
+$tmpArr = [$token, $timestamp, $nonce];
+sort($tmpArr, SORT_STRING);
+$tmpStr = implode($tmpArr);
+$tmpStr = sha1($tmpStr);
+
+if ($tmpStr == $signature && !empty($echostr)) {
+    echo $echostr;
+    exit;
+}
+
+// 取得 POST 請求內容
+$input = file_get_contents('php://input');
+logme("Received input: " . $input);
+
+// 將 XML 內容解析為對象
+libxml_disable_entity_loader(true); // 安全考量，避免 XML 注入
+$data = simplexml_load_string($input, 'SimpleXMLElement', LIBXML_NOCDATA);
+
+if ($data === false) {
+    logme("Failed to parse XML input");
+    exit;
+}
+
+// 獲取消息類型和用戶信息
+$msgType = strtolower($data->MsgType);
+$user_id = $data->FromUserName;
+$to_user = $data->ToUserName;
+$createTime = (int) $data->CreateTime; // 当前消息的时间戳
+
+logme("Processing event for user: $user_id");
+
+$messages = [];
+
+// 根據消息類型處理消息
+switch ($msgType) {
+    case "text":
+        $content = trim($data->Content);
+        $reply_content = "您發送的消息是：" . $content;		
+		logme("Received image with URL: $reply_content");
+        $messages[] = generateTextReply($user_id, $to_user, $reply_content);
+        break;
+
+    case "image":	
+		$conn = getDatabaseConnection(); // 获取数据库连接
+		$last_message_time = getLastMessageTime($user_id, $conn);
+		// 判断是否在50秒内收到重复消息
+		if ($last_message_time !== null && ($createTime - $last_message_time < 50)) {
+			logme("Message from $user_id within 50 seconds, skipping duplicate.");
+			quickReply($user_id, $to_user);	
+			exit;
+		}
+		updateLastMessageTime($user_id, $createTime, $conn);
+		$conn->close();
+		
+		//global $replyToken;
+		//$replyToken = $data->MsgId;
+        $image_url = trim($data->PicUrl);
+        logme("Received image with URL: $image_url");
+	imagent_wechat_menu;	
+        // 假設需要下載圖片進行進一步處理
+        $image_path = downloadImageFromUrl($image_url);
+		
+        if ($image_path) {
+            logme("Image downloaded successfully: $image_path");
+            $conn = getDatabaseConnection();
+            $profile = getUserProfile($user_id);
+            $wechat_user_name = $profile['nickname'];
+            logme("profile : $profile ");
+
+            updateUserName($conn, $user_id, $wechat_user_name);
+
+            if (isNewUser($conn, $user_id)) {
+                logme("User $user_id is a new user.");				
+				$qr_code_path = saveQRCode($user_id);
+				$modified_image_path = attachQRCodeToImage($image_path, $qr_code_path);
+				$qr_content = "HWAIS-" . $user_id;
+                if (saveNewUserData($conn, $user_id, $wechat_user_name, $qr_content)) {
+					//newuserReply($user_id, $to_user);
+                    // 添加带有 QR Code 的图片
+                    $modified_image_url = $line_image_url_base . $modified_image_path;
+                    logme("New user registered and reply message prepared for user: $user_id");
+					$qr_content = "HWAIS-" . $user_id;
+					if (isValidQRCode($conn, $qr_content, $user_id)) {
+						$quota = hasQuota($conn, $user_id);
+						if ($quota > 0) {
+							$result = askGPT($user_id, $image_path, $qr_content);
+							if ($result) {
+								$extracted_data = $result['extracted_data'];
+								$event_code = $result['event_code'];
+								$record_id = $result['record_id'];
+							}
+							if ($extracted_data) {
+								deductQuota($conn, $user_id);
+								$quota = hasQuota($conn, $user_id);
+								logme("Quota after deduction: $quota");
+							} else {
+								$message_text = "抱歉，無法獲取 GPT 的回應，請稍後再試。";
+								$messages[] = generateTextReply($user_id, $to_user, $message_text);
+								logme("Failed to get GPT response for user: $user_id");
+							}
+						} else {
+							$message_text = "$wechat_user_name，您的額度已用完，請明天再試或聯繫管理員。";
+							$messages[] = generateTextReply($user_id, $to_user, $message_text);
+							logme("User quota exhausted for user: $user_id");
+						}
+					} else {
+						$message_text = "$wechat_user_name，您的 QR 碼無效，請聯繫管理員。";
+						$messages[] = generateTextReply($user_id, $to_user, $message_text);
+						logme("Invalid QR Code for user: $user_id");
+					}
+                } else {
+                    $message_text = "$wechat_user_name 註冊失敗，請聯繫管理員，並告知您的用戶 ID：$user_id";
+                    $messages[] = generateTextReply($user_id, $to_user, $message_text);
+                    logme("New user registration failed for user: $user_id");
+                }
+            } else {
+                logme("User $user_id is an existing user.");
+                $qr_content = decodeQRCodeUsingAPI($image_path);
+                if ($qr_content == '無法讀取二維碼') {
+                    logme("No valid QR Code detected for user: $user_id. Automatically adding QR Code.");
+                    $qr_code_path = saveQRCode($user_id);
+                    $modified_image_path = attachQRCodeToImage($image_path, $qr_code_path);
+                    //$image_path = $modified_image_path;
+                    $qr_content = "HWAIS-" . $user_id;
+                }
+                logme("Final QR content: $qr_content");
+                //$image_path = $modified_image_path;
+                if (isValidQRCode($conn, $qr_content, $user_id)) {
+                    $quota = hasQuota($conn, $user_id);
+                    if ($quota > 0) {
+                        $result = askGPT($user_id, $image_path, $qr_content);
+                        if ($result) {
+                            $extracted_data = $result['extracted_data'];
+                            $event_code = $result['event_code'];
+                            $record_id = $result['record_id'];
+                        }
+
+                        if ($extracted_data) {
+                            deductQuota($conn, $user_id);
+                            $quota = hasQuota($conn, $user_id);
+                            logme("Quota after deduction: $quota");
+                        } else {
+                            $message_text = "抱歉，無法獲取 GPT 的回應，請稍後再試。";
+                            $messages[] = generateTextReply($user_id, $to_user, $message_text);
+                            logme("Failed to get GPT response for user: $user_id");
+                        }
+                    } else {
+                        $message_text = "$wechat_user_name，您的額度已用完，請明天再試或聯繫管理員。";
+                        $messages[] = generateTextReply($user_id, $to_user, $message_text);
+                        logme("User quota exhausted for user: $user_id");
+                    }
+                } else {
+                    $message_text = "$wechat_user_name，您的 QR 碼無效，請聯繫管理員。";
+                    $messages[] = generateTextReply($user_id, $to_user, $message_text);
+                    logme("Invalid QR Code for user: $user_id");
+                }
+            }
+
+            $conn->close();
+        } else {
+            $message_text = "抱歉，無法下載您的圖片。";
+            $messages[] = generateTextReply($user_id, $to_user, $message_text);
+            logme("Failed to download image for user: $user_id");
+        }
+        break;
+
+    default:
+		$conn = getDatabaseConnection();
+		$profile = getUserProfile($user_id);
+		$wechat_user_name = $profile['nickname'];
+		logme("profile : $profile ");
+		updateUserName($conn, $user_id, $wechat_user_name);
+		if (isNewUser($conn, $user_id)) {
+			logme("User $user_id is a new user. id=$user_id");	
+			$qr_content = "HWAIS-" . $user_id;
+			if (saveNewUserData($conn, $user_id, $wechat_user_name, $qr_content)) {
+				logme("New user registered and reply message prepared for user: $user_id");
+				$message_text1= "您好，欢迎来到AI Magic School 艺术中心\n\n";
+				$message_text1 .= "您的ID是".$user_id."\n\n";
+				$message_text1 .= "请上传一张图片，AI Magic 将为您生成艺术性，可玩性高的新图片并配上网文，快来试试看吧!";
+				$messages[] = generateTextReply($user_id, $to_user, $message_text1);
+			} else {
+				$message_text = "$wechat_user_name 注册失败，请联系管理员，并告知您的用户 ID：$user_id";
+				$messages[] = generateTextReply($user_id, $to_user, $message_text);
+			}
+		}
+        break;
+}
+
+// 最後回復用戶
+sendMessagesToUser($messages);
+
+function sendMessagesToUser($messages) {
+    // 确保响应头只设置一次
+    if (!empty($messages)) {
+        header('Content-Type: text/xml');
+        foreach ($messages as $message) {
+            logme("message to user: $message");
+            echo trim($message);
+        }
+    }
+}
+
+function quickReply($user_id, $to_user) {
+	global $line_image_url_base;
+global $store_url;
+    // 构建消息内容，包含用户查看生成作品的链接
+    $message_text = "您的消息已收到，我们正在处理。\n";
+    $message_text .= "大約5分鐘後，您可以到 " . $line_image_url_base . "wechat_findpost.php?user_id=" . $user_id . " 查尋進度。\n\n";
+    $message_text .= "每次作品生成需等待 5-10 分鐘，期間您可以到網站欣賞其他作品。\n\n";
+     $message_text .= "頻道專屬網站: $store_url\n\n";
+     $message_text .= "請耐心等待，並持續關心本頻道，有任何意見，歡迎留言 - AI Magic School 藝術推廣中心";
+
+    // 构建微信回复的 XML 消息
+    $response = "<xml>
+                    <ToUserName><![CDATA[$user_id]]></ToUserName>
+                    <FromUserName><![CDATA[$to_user]]></FromUserName>
+                    <CreateTime>" . time() . "</CreateTime>
+                    <MsgType><![CDATA[text]]></MsgType>
+                    <Content><![CDATA[$message_text]]></Content>
+                 </xml>";
+
+    // 输出响应并终止脚本
+    echo $response;
+    exit; // 确保立即返回并终止脚本
+}
+function newuserReply($user_id, $to_user) {
+	global $line_image_url_base;
+	global $store_url;
+    // 构建消息内容，包含用户查看生成作品的链接
+	$message_text = "$wechat_user_name 歡迎您使用 AI Magic，已經為您註冊成功！\n\n";
+	$message_text .= "您每天可免費使用兩次服務。\n\n";
+	$message_text .= "完成註冊後，需要您再次上傳您想要生成的原圖片，即可由 AI Magic 生成精彩作品。\n\n";
+	$message_text .= "每次作品生成需等待 5-10 分鐘，期間您可以到網站欣賞其他作品。\n\n";
+	$message_text .= "頻道專屬網站: $store_url\n\n";
+	$message_text .= "請再次上傳圖片，並持續關心本頻道，有任何意見，歡迎留言 - AI Magic School 藝術推廣中心";
+
+    // 构建微信回复的 XML 消息
+    $response = "<xml>
+                    <ToUserName><![CDATA[$user_id]]></ToUserName>
+                    <FromUserName><![CDATA[$to_user]]></FromUserName>
+                    <CreateTime>" . time() . "</CreateTime>
+                    <MsgType><![CDATA[text]]></MsgType>
+                    <Content><![CDATA[$message_text]]></Content>
+                 </xml>";
+
+    // 输出响应并终止脚本
+    echo $response;
+    //exit; // 确保立即返回并终止脚本
+}
+?>
+
+目錄：/hermes/bosnacweb08/bosnacweb08ar/b174/ipg.sweetekconnie46425/line/lineapi/php
+檔名：a1.php
+==================================================
+<?php
+
+//require_once 'config.php';
+//global $db_host,$db_user,$db_password,$db_name ;
+// 数据库连接信息
+$db_host = 'sweetekconnie46425.ipagemysql.com';
+$db_user = 'ericwang';
+$db_password = 'Eric010101)!)!)!';
+$db_name = 'sweetekconnie46_fvdg_qscsxdpmlak';  // 替换成你自己的数据库名称
+
+// 创建数据库连接
+$conn = new mysqli($db_host, $db_user, $db_password, $db_name);
+
+// 检查连接是否成功
+if ($conn->connect_error) {
+    die("Connection failed: " . $conn->connect_error);
+}
+
+// 获取用户输入的日期
+$input_date = isset($_GET['date']) ? $_GET['date'] : null; // 通过URL参数获取日期
+if (!$input_date) {
+    die("Please provide a date in the format '2024.12.6'");
+}
+// 将输入的日期转换为 MySQL datetime 格式
+$formatted_date = DateTime::createFromFormat('Y.m.d', $input_date)->format('Y-m-d');
+// 设置导出文件名
+$filename = 'top_production_log_' . $formatted_date . '.csv';
+
+// SQL 查询语句，查找指定日期的记录
+$sql = "SELECT gpt_responses_id, wordpress_post_ids, media_ids FROM production_log WHERE DATE(created_time) = ?";
+$stmt = $conn->prepare($sql);
+$stmt->bind_param("s", $formatted_date);
+$stmt->execute();
+$result = $stmt->get_result();
+
+// 设置文件类型和下载方式
+header('Content-Type: text/csv');
+header('Content-Disposition: attachment;filename="' . $filename . '"');
+header('Cache-Control: max-age=0');
+
+// 打开 PHP 输出流（文件句柄）
+$output = fopen('php://output', 'w');
+
+// 输出 CSV 表头
+fputcsv($output, array('gpt_responses_id', 'wordpress_post_ids', 'media_ids'));
+
+// 输出查询结果数据
+while ($data = $result->fetch_assoc()) {
+    fputcsv($output, array($data['gpt_responses_id'], $data['wordpress_post_ids'], $data['media_ids']));
+}
+
+// 关闭文件流
+fclose($output);
+
+// 关闭数据库连接
+$conn->close();
+?>
+
+
+目錄：/hermes/bosnacweb08/bosnacweb08ar/b174/ipg.sweetekconnie46425/line/lineapi/php
+檔名：a2.php
+==================================================
+<?php
+$ch_prefix="top";
+$store_url = "https://heatgroups.top/imagent/?p="; // 定义固定的 URL
+// 数据库连接信息
+$db_host = 'sweetekconnie46425.ipagemysql.com';
+$db_user = 'ericwang';
+$db_password = 'Eric010101)!)!)!';
+$db_name = 'sweetekconnie46_fvdg_qscsxdpmlak';
+
+// 设置时区，确保服务器时区正确
+date_default_timezone_set('Asia/Shanghai');
+
+// 创建数据库连接
+$conn = new mysqli($db_host, $db_user, $db_password, $db_name);
+
+// 检查连接是否成功
+if ($conn->connect_error) {
+    http_response_code(500);
+    die("Database connection failed: " . $conn->connect_error);
+}
+
+// 获取用户输入的日期区间
+$date1 = isset($_GET['date1']) ? trim($_GET['date1']) : null;
+$date2 = isset($_GET['date2']) ? trim($_GET['date2']) : null;
+
+// 输入验证
+if (!$date1 || !$date2) {
+    http_response_code(400);
+    die("Error: Please provide both 'date1' and 'date2' in the format 'YYYY.MM.DD'.");
+}
+
+// 解析输入日期
+$date1_obj = DateTime::createFromFormat('Y.m.d', $date1);
+$date2_obj = DateTime::createFromFormat('Y.m.d', $date2);
+
+// 检查日期解析是否成功
+if (!$date1_obj || !$date2_obj) {
+    http_response_code(400);
+    die("Error: Invalid date format. Please use 'YYYY.MM.DD'.");
+}
+
+$date1 = $date1_obj->format('Y-m-d');
+$date2 = $date2_obj->format('Y-m-d');
+
+// 转换日期为 DateTime 对象
+$start_date = new DateTime($date1);
+$end_date = new DateTime($date2);
+
+// 检查日期逻辑
+if ($start_date > $end_date) {
+    http_response_code(400);
+    die("Error: 'date1' cannot be later than 'date2'.");
+}
+
+if ($start_date->diff($end_date)->days > 180) {
+    http_response_code(400);
+    die("Error: The date range cannot exceed 180 days.");
+}
+
+// 清理输出缓冲区，确保 HTTP 头正确输出
+if (ob_get_length()) {
+    ob_clean();
+}
+flush();
+
+// 初始化 ZIP 文件下载头
+header('Content-Type: application/zip');
+header('Content-Disposition: attachment; filename="' . $ch_prefix . '_production_logs_' . $start_date->format('Y-m-d') . '_to_' . $end_date->format('Y-m-d') . '.zip"');
+header('Cache-Control: no-cache');
+
+// 临时目录存储 CSV 文件
+$temp_dir = sys_get_temp_dir() . '/csv_files_' . uniqid();
+mkdir($temp_dir);
+
+// 生成每天的 CSV 文件（仅生成有数据的文件）
+$current_date = clone $start_date;
+$has_data = false; // 标记是否至少有一天有数据
+while ($current_date <= $end_date) {
+    $formatted_date = $current_date->format('Y-m-d');
+    $filename = $temp_dir . '/'. $ch_prefix .'_production_log_' . $formatted_date . '.csv';
+
+    // 执行 SQL 查询
+    $sql = "SELECT gpt_responses_id, wordpress_post_ids, media_ids FROM production_log WHERE DATE(created_time) = ?";
+    $stmt = $conn->prepare($sql);
+    $stmt->bind_param("s", $formatted_date);
+    $stmt->execute();
+    $result = $stmt->get_result();
+
+    // 检查是否有数据
+    if ($result->num_rows > 0) {
+        $has_data = true; // 至少有一天有数据
+        // 打开 CSV 文件
+        $output = fopen($filename, 'w');
+    fputcsv($output, array('post_url', 'gpt_responses_id', 'wordpress_post_ids', 'media_ids'));
+
+    // 写入数据
+    while ($row = $result->fetch_assoc()) {
+        // 为 gpt_responses_id 拼接 store_url
+        $post_url = $store_url . $row['wordpress_post_ids'];
+        
+        // 将数据重新组织，增加 post_url 列
+        fputcsv($output, array(
+            'post_url' => $post_url,
+            'gpt_responses_id' => $row['gpt_responses_id'],
+            'wordpress_post_ids' => $row['wordpress_post_ids'],
+            'media_ids' => $row['media_ids']
+        ));
+    }
+
+        fclose($output);
+    }
+    $current_date->modify('+1 day'); // 下一天
+}
+
+// 关闭数据库连接
+$conn->close();
+
+// 如果没有任何数据，则返回提示
+if (!$has_data) {
+    array_map('unlink', glob("$temp_dir/*"));
+    rmdir($temp_dir);
+    http_response_code(404);
+    die("No data available for the given date range.");
+}
+
+// 压缩 CSV 文件到 ZIP
+$zip = new ZipArchive();
+$zip_file = tempnam(sys_get_temp_dir(), 'zip');
+if ($zip->open($zip_file, ZipArchive::CREATE) === TRUE) {
+    foreach (scandir($temp_dir) as $file) {
+        if ($file !== '.' && $file !== '..') {
+            $zip->addFile($temp_dir . '/' . $file, $file);
+        }
+    }
+    $zip->close();
+} else {
+    die("Failed to create ZIP file.");
+}
+
+// 输出 ZIP 文件
+readfile($zip_file);
+
+// 清理临时文件
+array_map('unlink', glob("$temp_dir/*"));
+rmdir($temp_dir);
+unlink($zip_file);
+
+exit;
+
+?>
+
+
+目錄：/hermes/bosnacweb08/bosnacweb08ar/b174/ipg.sweetekconnie46425/line/lineapi/php
+檔名：direct_ai.php
+==================================================
+<?php
+// 檢查是否有接收到 imgurl 參數
+if (isset($_GET['imgurl'])) {
+    // 取得 imgurl 參數
+    $imgurl = $_GET['imgurl'];
+    
+    // 回傳接收到的網址
+    echo "接收到的圖片 URL: " . htmlspecialchars($imgurl);
+} else {
+    // 若未傳入參數，回傳錯誤訊息
+    echo "錯誤: 未接收到 imgurl 參數！";
+}
+?>
+
+目錄：/hermes/bosnacweb08/bosnacweb08ar/b174/ipg.sweetekconnie46425/line/lineapi/php
+檔名：direct_ai2.php
+==================================================
+<?php
+// direct_ai.php
+
+require_once 'wechat_config.php';
+require_once 'wechat_database.php';
+require_once 'wechat_functions.php';
+require_once 'wechat_qr_code_functions.php';
+require_once 'wechat_gpt_functions.php';
+require_once 'wechat_utility.php';
+
+date_default_timezone_set("Asia/Shanghai");
+
+// 預設的 user_id
+$user_id = "o52cn6ZQ4djnEmpD7eWM36eWazCs";
+
+// 檢查是否接收到 imgurl 參數
+if (!isset($_GET['imgurl']) || empty($_GET['imgurl'])) {
+    echo "錯誤: 未提供 imgurl 參數！";
+    logme("Error: Missing imgurl parameter");
+    exit;
+}
+
+$image_url = trim($_GET['imgurl']);
+logme("Received imgurl: $image_url");
+    // 回傳接收到的網址
+    echo "接收到的圖片 URL: " . htmlspecialchars($image_url);
+// 下載圖片
+$image_path = downloadImageFromUrl($image_url);
+
+if (!$image_path) {
+    echo "錯誤: 無法下載圖片。";
+    logme("Error: Failed to download image from URL: $image_url");
+    exit;
+}
+
+logme("Image downloaded successfully: $image_path");
+
+// 連接資料庫
+$conn = getDatabaseConnection();
+
+// 取得使用者的基本資料（固定 user_id）
+$profile = getUserProfile($user_id);
+$wechat_user_name = $profile['nickname'] ?? "AI_User";
+logme("Using predefined user_id: $user_id, nickname: $wechat_user_name");
+
+// 更新使用者名稱（可選）
+updateUserName($conn, $user_id, $wechat_user_name);
+
+// 處理圖片（例如附加 QR Code，或向 GPT 請求分析）
+$qr_code_path = saveQRCode($user_id);
+$modified_image_path = attachQRCodeToImage($image_path, $qr_code_path);
+logme("QR Code attached to image: $modified_image_path");
+
+// 呼叫 GPT 處理圖片
+$result = askGPT($user_id, $image_path, "HWAIS-$user_id");
+
+if ($result) {
+    $extracted_data = $result['extracted_data'] ?? null;
+    if ($extracted_data) {
+        logme("GPT extracted data: " . json_encode($extracted_data));
+        echo "處理完成！GPT 返回的資料: " . htmlspecialchars(json_encode($extracted_data));
+    } else {
+        echo "GPT 無法處理圖片，請稍後再試。";
+        logme("GPT failed to process image for user: $user_id");
+    }
+} else {
+    echo "GPT 請求失敗，請稍後再試。";
+    logme("Error: Failed to get GPT response for user: $user_id");
+}
+
+// 關閉資料庫連接
+$conn->close();
+
+logme("direct_ai.php 執行完成");
+
+?>
+
+
+目錄：/hermes/bosnacweb08/bosnacweb08ar/b174/ipg.sweetekconnie46425/line/lineapi/php
+檔名：getcsv.php
+==================================================
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Production Logs Export</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 20px;
+        }
+        h1 {
+            text-align: center;
+        }
+        form {
+            max-width: 400px;
+            margin: 0 auto;
+            background-color: #f9f9f9;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 5px rgba(0, 0, 0, 0.1);
+        }
+        label {
+            display: block;
+            margin-bottom: 10px;
+            font-weight: bold;
+        }
+        input[type="date"] {
+            width: 100%;
+            padding: 8px;
+            margin-bottom: 15px;
+            border: 1px solid #ccc;
+            border-radius: 4px;
+        }
+        input[type="submit"] {
+            background-color: #4CAF50;
+            color: white;
+            padding: 10px 15px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            width: 100%;
+        }
+        input[type="submit"]:hover {
+            background-color: #45a049;
+        }
+        .error {
+            color: red;
+            text-align: center;
+        }
+    </style>
+</head>
+<body>
+    <h1>Production Logs Export</h1>
+    <form action="" method="GET">
+        <label for="date1">Start Date:</label>
+        <input type="date" id="date1" name="date1" required>
+
+        <label for="date2">End Date:</label>
+        <input type="date" id="date2" name="date2" required>
+
+        <input type="submit" value="Download Logs">
+    </form>
+
+<?php
+if ($_SERVER['REQUEST_METHOD'] == 'GET' && isset($_GET['date1']) && isset($_GET['date2'])) {
+    $date1 = trim($_GET['date1']);
+    $date2 = trim($_GET['date2']);
+
+    if (!$date1 || !$date2) {
+        echo "<p class='error'>Please select both start and end dates.</p>";
+        exit;
+    }
+
+    // 触发文件下载逻辑
+    header("Location: download.php?date1=$date1&date2=$date2");
+    exit;
+}
+?>
+</body>
+</html>
+
+
+目錄：/hermes/bosnacweb08/bosnacweb08ar/b174/ipg.sweetekconnie46425/line/lineapi/php
+檔名：wechathook2_bk20250123.php
+==================================================
+<?php
+// wechat_webhook.php
+
+require_once 'wechat_config.php';
+require_once 'wechat_database.php';
+require_once 'wechat_functions.php';
+require_once 'wechat_qr_code_functions.php';
+require_once 'wechat_gpt_functions.php';
+require_once 'wechat_utility.php';
+
+date_default_timezone_set("Asia/Shanghai");
+
+// 校验微信服务器的请求
+$token = "WxEqualsecureToken2024";
+$signature = $_GET["signature"] ?? '';
+$timestamp = $_GET["timestamp"] ?? '';
+$nonce = $_GET["nonce"] ?? '';
+$echostr = $_GET["echostr"] ?? '';
+
+$wechat_appid='wx06667787d2417c77';
+$wechat_secret='ed016bba58fa2dcfe961bac782c8b9c0';
+$wechat_access_token='';
+
+$tmpArr = [$token, $timestamp, $nonce];
+sort($tmpArr, SORT_STRING);
+$tmpStr = implode($tmpArr);
+$tmpStr = sha1($tmpStr);
+
+if ($tmpStr == $signature && !empty($echostr)) {
+    echo $echostr;
+    exit;
+}
+
+// 取得 POST 请求内容
+$input = file_get_contents('php://input');
+logme("Received input: " . $input);
+
+// 将 XML 内容解析为对象
+libxml_disable_entity_loader(true); // 安全考量，避免 XML 注入
+$data = simplexml_load_string($input, 'SimpleXMLElement', LIBXML_NOCDATA);
+
+if ($data === false) {
+    logme("Failed to parse XML input");
+    exit;
+}
+
+// 获取消息类型和用户信息
+$msgType = strtolower($data->MsgType);
+$user_id = $data->FromUserName;
+$to_user = $data->ToUserName;
+$createTime = (int) $data->CreateTime; // 当前消息的时间戳
+
+logme("Processing event for user: $user_id");
+
+$messages = [];
+
+// 根据消息类型处理消息
+switch ($msgType) {
+    case "text":
+        $content = trim($data->Content);
+        $reply_content = "您发送的消息是：" . $content;		
+		logme("Received image with URL: $reply_content");
+        $messages[] = generateTextReply($user_id, $to_user, $reply_content);
+        break;
+
+    case "image":	
+		$conn = getDatabaseConnection(); // 获取数据库连接
+		$last_message_time = getLastMessageTime($user_id, $conn);
+		// 判断是否在50秒内收到重复消息
+		if ($last_message_time !== null && ($createTime - $last_message_time < 50)) {
+			logme("Message from $user_id within 50 seconds, skipping duplicate.");
+			quickReply($user_id, $to_user);	
+			exit;
+		}
+		updateLastMessageTime($user_id, $createTime, $conn);
+		$conn->close();
+		
+		//global $replyToken;
+		//$replyToken = $data->MsgId;
+        $image_url = trim($data->PicUrl);
+        logme("Received image with URL: $image_url");
+	imagent_wechat_menu;	
+        // 假设需要下载图片进行进一步处理
+        $image_path = downloadImageFromUrl($image_url);
+		
+        if ($image_path) {
+            logme("Image downloaded successfully: $image_path");
+            $conn = getDatabaseConnection();
+            $profile = getUserProfile($user_id);
+            $wechat_user_name = $profile['nickname'];
+            logme("profile : $profile ");
+
+            updateUserName($conn, $user_id, $wechat_user_name);
+
+            if (isNewUser($conn, $user_id)) {
+                logme("User $user_id is a new user.");				
+				$qr_code_path = saveQRCode($user_id);
+				$modified_image_path = attachQRCodeToImage($image_path, $qr_code_path);
+				$qr_content = "HWAIS-" . $user_id;
+                if (saveNewUserData($conn, $user_id, $wechat_user_name, $qr_content)) {
+					//newuserReply($user_id, $to_user);
+                    // 添加带有 QR Code 的图片
+                    $modified_image_url = $line_image_url_base . $modified_image_path;
+                    logme("New user registered and reply message prepared for user: $user_id");
+					$qr_content = "HWAIS-" . $user_id;
+					if (isValidQRCode($conn, $qr_content, $user_id)) {
+						$quota = hasQuota($conn, $user_id);
+						if ($quota > 0) {
+							$result = askGPT($user_id, $image_path, $qr_content);
+							if ($result) {
+								$extracted_data = $result['extracted_data'];
+								$event_code = $result['event_code'];
+								$record_id = $result['record_id'];
+							}
+							if ($extracted_data) {
+								deductQuota($conn, $user_id);
+								$quota = hasQuota($conn, $user_id);
+								logme("Quota after deduction: $quota");
+							} else {
+								$message_text = "抱歉，无法获取 GPT 的回应，请稍后再试。";
+								$messages[] = generateTextReply($user_id, $to_user, $message_text);
+								logme("Failed to get GPT response for user: $user_id");
+							}
+						} else {
+							$message_text = "$wechat_user_name，您的额度已用完，请明天再试或联系管理员。";
+							$messages[] = generateTextReply($user_id, $to_user, $message_text);
+							logme("User quota exhausted for user: $user_id");
+						}
+					} else {
+						$message_text = "$wechat_user_name 无法识别您的图片，再试一次，或更换图片试试!";
+						$messages[] = generateTextReply($user_id, $to_user, $message_text);
+						logme("Invalid QR Code for user: $user_id");
+					}
+                } else {
+                    $message_text = "$wechat_user_name 注册失败，请联系管理员，并告知您的用户 ID：$user_id";
+                    $messages[] = generateTextReply($user_id, $to_user, $message_text);
+                    logme("New user registration failed for user: $user_id");
+                }
+            } else {
+                logme("User $user_id is an existing user.");
+                $qr_content = decodeQRCodeUsingAPI($image_path);
+                $qr_content = "HWAIS-" . $user_id;
+                if ($qr_content == '无法读取二维码') {
+                    logme("No valid QR Code detected for user: $user_id. Automatically adding QR Code.");
+                    $qr_code_path = saveQRCode($user_id);
+                    $modified_image_path = attachQRCodeToImage($image_path, $qr_code_path);
+                    //$image_path = $modified_image_path;
+                    $qr_content = "HWAIS-" . $user_id;
+                }
+                logme("Final QR content: $qr_content");
+                //$image_path = $modified_image_path;
+                if (isValidQRCode($conn, $qr_content, $user_id)) {
+                    $quota = hasQuota($conn, $user_id);
+                    if ($quota > 0) {
+                        $result = askGPT($user_id, $image_path, $qr_content);
+                        if ($result) {
+                            $extracted_data = $result['extracted_data'];
+                            $event_code = $result['event_code'];
+                            $record_id = $result['record_id'];
+                        }
+
+                        if ($extracted_data) {
+                            deductQuota($conn, $user_id);
+                            $quota = hasQuota($conn, $user_id);
+                            logme("Quota after deduction: $quota");
+                        } else {
+                            $message_text = "抱歉，无法获取 GPT 的回应，请稍后再试。";
+                            $messages[] = generateTextReply($user_id, $to_user, $message_text);
+                            logme("Failed to get GPT response for user: $user_id");
+                        }
+                    } else {
+                        $message_text = "$wechat_user_name，您的额度已用完，请明天再试或联系管理员。";
+                        $messages[] = generateTextReply($user_id, $to_user, $message_text);
+                        logme("User quota exhausted for user: $user_id");
+                    }
+                } else {
+                    $message_text = "$wechat_user_name，无法识别您的图片，再试一次，或更换图片试试。";
+                    $messages[] = generateTextReply($user_id, $to_user, $message_text);
+                    logme("Invalid QR Code for user: $user_id");
+                }
+            }
+
+            $conn->close();
+        } else {
+            $message_text = "抱歉，无法下载您的图片。";
+            $messages[] = generateTextReply($user_id, $to_user, $message_text);
+            logme("Failed to download image for user: $user_id");
+        }
+        break;
+
+    default:
+		$conn = getDatabaseConnection();
+		$profile = getUserProfile($user_id);
+		$wechat_user_name = $profile['nickname'];
+		logme("profile : $profile ");
+		updateUserName($conn, $user_id, $wechat_user_name);
+		if (isNewUser($conn, $user_id)) {
+			logme("User $user_id is a new user. id=$user_id");	
+			$qr_content = "HWAIS-" . $user_id;
+			if (saveNewUserData($conn, $user_id, $wechat_user_name, $qr_content)) {
+				logme("New user registered and reply message prepared for user: $user_id");
+				$message_text1= "您好，欢迎来到AI Magic School 艺术中心\n\n";
+				$message_text1 .= "您的ID是".$user_id."\n\n";
+				$message_text1 .= "请上传一张图片，AI Magic 将为您生成艺术性高的新图片并配上网文，快来试试看吧!";
+				$messages[] = generateTextReply($user_id, $to_user, $message_text1);
+			} else {
+				$message_text = "$wechat_user_name 注册失败，请联系管理员，并告知您的用户 ID：$user_id";
+				$messages[] = generateTextReply($user_id, $to_user, $message_text);
+			}
+		}
+        break;
+}
+
+// 最后回复用户
+sendMessagesToUser($messages);
+
+function sendMessagesToUser($messages) {
+    // 确保响应头只设置一次
+    if (!empty($messages)) {
+        header('Content-Type: text/xml');
+        foreach ($messages as $message) {
+            logme("message to user: $message");
+            echo trim($message);
+        }
+    }
+}
+
+function quickReply($user_id, $to_user) {
+	global $line_image_url_base;
+global $store_url;
+    // 构建消息内容，包含用户查看生成作品的链接
+    $message_text = "您的消息已收到，我们正在处理。\n";
+   // $message_text .= "大约5分钟后，您可以到 " . $line_image_url_base . "wechat_findpost.php?user_id=" . $user_id . " 查寻进度。\n\n";
+    $message_text .= "每次作品生成需等待 5-10 分钟，期间您可以到网站欣赏其他作品。\n\n";
+     $message_text .= "ImAgent专属网站: $store_url\n\n";
+     $message_text .= "在某些情况下，AI可能无法识别您的图片，您可以再试一次，或更换图片试试!\n\n";
+     $message_text .= "请耐心等待，并持续关心本频道，有任何意见，欢迎留言 - ImAgent 艺术推广中心\n\n";
+
+    // 构建微信回复的 XML 消息
+    $response = "<xml>
+                    <ToUserName><![CDATA[$user_id]]></ToUserName>
+                    <FromUserName><![CDATA[$to_user]]></FromUserName>
+                    <CreateTime>" . time() . "</CreateTime>
+                    <MsgType><![CDATA[text]]></MsgType>
+                    <Content><![CDATA[$message_text]]></Content>
+                 </xml>";
+
+    // 输出响应并终止脚本
+    echo $response;
+    exit; // 确保立即返回并终止脚本
+}
+function newuserReply($user_id, $to_user) {
+	global $line_image_url_base;
+	global $store_url;
+    // 构建消息内容，包含用户查看生成作品的链接
+	$message_text = "$wechat_user_name 欢迎您使用 AI Magic，已经为您注册成功！\n\n";
+	$message_text .= "您可免费使用10次服务。\n\n";
+	$message_text .= "完成注册后，需要您再次上传您想要生成的原图片，即可由 AI Magic 生成精彩作品。\n\n";
+	$message_text .= "每次作品生成需等待 5-10 分钟，期间您可以到网站欣赏其他作品。\n\n";
+	$message_text .= "频道专属网站: $store_url\n\n";
+        $message_text .= "在某些情况下，AI可能无法识别您的图片，您可以再试一次，或更换图片试试!\n\n";
+	$message_text .= "请再次上传图片，并持续关心本频道，有任何意见，欢迎留言 - AI Magic 艺术推广中心";
+
+    // 构建微信回复的 XML 消息
+    $response = "<xml>
+                    <ToUserName><![CDATA[$user_id]]></ToUserName>
+                    <FromUserName><![CDATA[$to_user]]></FromUserName>
+                    <CreateTime>" . time() . "</CreateTime>
+                    <MsgType><![CDATA[text]]></MsgType>
+                    <Content><![CDATA[$message_text]]></Content>
+                 </xml>";
+
+    // 输出响应并终止脚本
+    echo $response;
+    //exit; // 确保立即返回并终止脚本
+}
+?>
+
+
+目錄：/hermes/bosnacweb08/bosnacweb08ar/b174/ipg.sweetekconnie46425/line/lineapi/php
+檔名：wechat_config_bk20250123.php
+==================================================
+<?php
+// wechat_config.php
+//$openai_api_key = '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';
+
+$openai_api_key = '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';
+
+$openai_api_key = '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';
+
+// WeChat API Keys
+$wechat_app_id = 'wx06667787d2417c77';
+$wechat_app_secret = 'ed016bba58fa2dcfe961bac782c8b9c0';
+$wechat_token = 'WxEqualsecureToken2024';
+$wechat_access_token_url = 'https://api.weixin.qq.com/cgi-bin/token';
+$wechat_message_url = 'https://api.weixin.qq.com/cgi-bin/message/custom/send?access_token=';
+
+// Database credentials (unchanged)
+$db_host = 'sweetekconnie46425.ipagemysql.com';
+$db_user = 'ericwang';
+$db_password = 'Eric010101)!)!)!';
+$db_name = 'sweetekconnie46_fvdg_qscsxdpmlak';
+
+// URL configurations
+$qr_code_url = 'https://api.qrserver.com/v1/create-qr-code/?size=150x150&data=';
+//$wechat_image_url_base = 'https://api.weixin.qq.com/cgi-bin/media/upload?access_token=';
+$wechat_image_url_base = 'https://line.heatgroups.com/lineapi/php/';
+$line_image_url_base = 'https://line.heatgroups.com/lineapi/php/';
+$store_url = 'https://heatgroups.top/imagent/';
+
+// Default prompt
+$default_prompt = 'AI Magic for image generation';
+
+?>
+
+目錄：/hermes/bosnacweb08/bosnacweb08ar/b174/ipg.sweetekconnie46425/line/lineapi/php
+檔名：gpt_functions_bk_20250123.php
+==================================================
+
+
+目錄：/hermes/bosnacweb08/bosnacweb08ar/b174/ipg.sweetekconnie46425/line/lineapi/php
+檔名：wechat_webhook_aidrawinfun2025.php
+==================================================
+<?php
+// wechat_webhook.php
+
+require_once 'wechat_config.php';
+require_once 'wechat_database.php';
+require_once 'wechat_functions.php';
+require_once 'wechat_qr_code_functions.php';
+require_once 'wechat_gpt_functions.php';
+require_once 'wechat_utility.php';
+
+date_default_timezone_set("Asia/Shanghai");
+
+// 校验微信服务器的请求
+$token = "WxEqualsecureToken2024";
+$signature = $_GET["signature"] ?? '';
+$timestamp = $_GET["timestamp"] ?? '';
+$nonce = $_GET["nonce"] ?? '';
+$echostr = $_GET["echostr"] ?? '';
+
+$wechat_appid='wxb60e32f6dcaa5d3b';
+$wechat_secret='cc61daf29bc16949ea8756177bdcbe09';
+$wechat_access_token='';
+
+$tmpArr = [$token, $timestamp, $nonce];
+sort($tmpArr, SORT_STRING);
+$tmpStr = implode($tmpArr);
+$tmpStr = sha1($tmpStr);
+
+if ($tmpStr == $signature && !empty($echostr)) {
+    echo $echostr;
+    exit;
+}
+
+// 取得 POST 请求内容
+$input = file_get_contents('php://input');
+logme("Received input: " . $input);
+
+// 将 XML 内容解析为对象
+libxml_disable_entity_loader(true); // 安全考量，避免 XML 注入
+$data = simplexml_load_string($input, 'SimpleXMLElement', LIBXML_NOCDATA);
+
+if ($data === false) {
+    logme("Failed to parse XML input");
+    exit;
+}
+
+// 获取消息类型和用户信息
+$msgType = strtolower($data->MsgType);
+$user_id = $data->FromUserName;
+$to_user = $data->ToUserName;
+$createTime = (int) $data->CreateTime; // 当前消息的时间戳
+
+logme("Processing event for user: $user_id");
+
+$messages = [];
+
+// 根据消息类型处理消息
+switch ($msgType) {
+    case "text":
+        $content = trim($data->Content);
+        $reply_content = "您发送的消息是：" . $content;		
+		logme("Received image with URL: $reply_content");
+        $messages[] = generateTextReply($user_id, $to_user, $reply_content);
+        break;
+
+    case "image":	
+		$conn = getDatabaseConnection(); // 获取数据库连接
+		$last_message_time = getLastMessageTime($user_id, $conn);
+		// 判断是否在50秒内收到重复消息
+		if ($last_message_time !== null && ($createTime - $last_message_time < 50)) {
+			logme("Message from $user_id within 50 seconds, skipping duplicate.");
+			quickReply($user_id, $to_user);	
+			exit;
+		}
+		updateLastMessageTime($user_id, $createTime, $conn);
+		$conn->close();
+		
+		//global $replyToken;
+		//$replyToken = $data->MsgId;
+        $image_url = trim($data->PicUrl);
+        logme("Received image with URL: $image_url");
+	imagent_wechat_menu;	
+        // 假设需要下载图片进行进一步处理
+        $image_path = downloadImageFromUrl($image_url);
+		
+        if ($image_path) {
+            logme("Image downloaded successfully: $image_path");
+            $conn = getDatabaseConnection();
+            $profile = getUserProfile($user_id);
+            $wechat_user_name = $profile['nickname'];
+            logme("profile : $profile ");
+
+            updateUserName($conn, $user_id, $wechat_user_name);
+
+            if (isNewUser($conn, $user_id)) {
+                logme("User $user_id is a new user.");				
+				$qr_code_path = saveQRCode($user_id);
+				$modified_image_path = attachQRCodeToImage($image_path, $qr_code_path);
+				$qr_content = "HWAIS-" . $user_id;
+                if (saveNewUserData($conn, $user_id, $wechat_user_name, $qr_content)) {
+					//newuserReply($user_id, $to_user);
+                    // 添加带有 QR Code 的图片
+                    $modified_image_url = $line_image_url_base . $modified_image_path;
+                    logme("New user registered and reply message prepared for user: $user_id");
+					$qr_content = "HWAIS-" . $user_id;
+					if (isValidQRCode($conn, $qr_content, $user_id)) {
+						$quota = hasQuota($conn, $user_id);
+						if ($quota > 0) {
+							$result = askGPT($user_id, $image_path, $qr_content);
+                                                        //$result = askDeepSeek($user_id, $image_path, $qr_content);
+
+							if ($result) {
+								$extracted_data = $result['extracted_data'];
+								$event_code = $result['event_code'];
+								$record_id = $result['record_id'];
+							}
+							if ($extracted_data) {
+								deductQuota($conn, $user_id);
+								$quota = hasQuota($conn, $user_id);
+								logme("Quota after deduction: $quota");
+							} else {
+								$message_text = "抱歉，无法获取 GPT 的回应，请稍后再试。";
+								$messages[] = generateTextReply($user_id, $to_user, $message_text);
+								logme("Failed to get GPT response for user: $user_id");
+							}
+						} else {
+							$message_text = "$wechat_user_name，您的额度已用完，请明天再试或联系管理员。";
+							$messages[] = generateTextReply($user_id, $to_user, $message_text);
+							logme("User quota exhausted for user: $user_id");
+						}
+					} else {
+						$message_text = "$wechat_user_name 无法识别您的图片，再试一次，或更换图片试试!";
+						$messages[] = generateTextReply($user_id, $to_user, $message_text);
+						logme("Invalid QR Code for user: $user_id");
+					}
+                } else {
+                    $message_text = "$wechat_user_name 注册失败，请联系管理员，并告知您的用户 ID：$user_id";
+                    $messages[] = generateTextReply($user_id, $to_user, $message_text);
+                    logme("New user registration failed for user: $user_id");
+                }
+            } else {
+                logme("User $user_id is an existing user.");
+                $qr_content = decodeQRCodeUsingAPI($image_path);
+                $qr_content = "HWAIS-" . $user_id;
+                if ($qr_content == '无法读取二维码') {
+                    logme("No valid QR Code detected for user: $user_id. Automatically adding QR Code.");
+                    $qr_code_path = saveQRCode($user_id);
+                    $modified_image_path = attachQRCodeToImage($image_path, $qr_code_path);
+                    //$image_path = $modified_image_path;
+                    $qr_content = "HWAIS-" . $user_id;
+                }
+                logme("Final QR content: $qr_content");
+                //$image_path = $modified_image_path;
+                if (isValidQRCode($conn, $qr_content, $user_id)) {
+                    $quota = hasQuota($conn, $user_id);
+                    if ($quota > 0) {
+                        $result = askGPT($user_id, $image_path, $qr_content);
+                        // $result = askDeepSeek($user_id, $image_path, $qr_content);
+                        if ($result) {
+                            $extracted_data = $result['extracted_data'];
+                            $event_code = $result['event_code'];
+                            $record_id = $result['record_id'];
+                        }
+
+                        if ($extracted_data) {
+                            deductQuota($conn, $user_id);
+                            $quota = hasQuota($conn, $user_id);
+                            logme("Quota after deduction: $quota");
+                        } else {
+                            $message_text = "抱歉，无法获取 GPT 的回应，请稍后再试。";
+                            $messages[] = generateTextReply($user_id, $to_user, $message_text);
+                            logme("Failed to get GPT response for user: $user_id");
+                        }
+                    } else {
+                        $message_text = "$wechat_user_name，您的额度已用完，请明天再试或联系管理员。";
+                        $messages[] = generateTextReply($user_id, $to_user, $message_text);
+                        logme("User quota exhausted for user: $user_id");
+                    }
+                } else {
+                    $message_text = "$wechat_user_name，无法识别您的图片，再试一次，或更换图片试试。";
+                    $messages[] = generateTextReply($user_id, $to_user, $message_text);
+                    logme("Invalid QR Code for user: $user_id");
+                }
+            }
+
+            $conn->close();
+        } else {
+            $message_text = "抱歉，无法下载您的图片。";
+            $messages[] = generateTextReply($user_id, $to_user, $message_text);
+            logme("Failed to download image for user: $user_id");
+        }
+        break;
+
+    default:
+		$conn = getDatabaseConnection();
+		$profile = getUserProfile($user_id);
+		$wechat_user_name = $profile['nickname'];
+		logme("profile : $profile ");
+		updateUserName($conn, $user_id, $wechat_user_name);
+		if (isNewUser($conn, $user_id)) {
+			logme("User $user_id is a new user. id=$user_id");	
+			$qr_content = "HWAIS-" . $user_id;
+			if (saveNewUserData($conn, $user_id, $wechat_user_name, $qr_content)) {
+				logme("New user registered and reply message prepared for user: $user_id");
+				$message_text1= "您好，欢迎来到AI Magic School 艺术中心\n\n";
+				$message_text1 .= "您的ID是".$user_id."\n\n";
+				$message_text1 .= "请上传一张图片，AI Magic 将为您生成艺术性高的新图片并配上网文，快来试试看吧!";
+				$messages[] = generateTextReply($user_id, $to_user, $message_text1);
+			} else {
+				$message_text = "$wechat_user_name 注册失败，请联系管理员，并告知您的用户 ID：$user_id";
+				$messages[] = generateTextReply($user_id, $to_user, $message_text);
+			}
+		}
+        break;
+}
+
+// 最后回复用户
+sendMessagesToUser($messages);
+
+function sendMessagesToUser($messages) {
+    // 确保响应头只设置一次
+    if (!empty($messages)) {
+        header('Content-Type: text/xml');
+        foreach ($messages as $message) {
+            logme("message to user: $message");
+            echo trim($message);
+        }
+    }
+}
+
+function quickReply($user_id, $to_user) {
+	global $line_image_url_base;
+global $store_url;
+    // 构建消息内容，包含用户查看生成作品的链接
+    $message_text = "您的消息已收到，我们正在处理。\n";
+   // $message_text .= "大约5分钟后，您可以到 " . $line_image_url_base . "wechat_findpost.php?user_id=" . $user_id . " 查寻进度。\n\n";
+    $message_text .= "每次作品生成需等待 5-10 分钟，期间您可以到网站欣赏其他作品。\n\n";
+     $message_text .= "ImAgent专属网站: $store_url\n\n";
+     $message_text .= "在某些情况下，AI可能无法识别您的图片，您可以再试一次，或更换图片试试!\n\n";
+     $message_text .= "请耐心等待，并持续关心本频道，有任何意见，欢迎留言 - ImAgent 艺术推广中心\n\n";
+
+    // 构建微信回复的 XML 消息
+    $response = "<xml>
+                    <ToUserName><![CDATA[$user_id]]></ToUserName>
+                    <FromUserName><![CDATA[$to_user]]></FromUserName>
+                    <CreateTime>" . time() . "</CreateTime>
+                    <MsgType><![CDATA[text]]></MsgType>
+                    <Content><![CDATA[$message_text]]></Content>
+                 </xml>";
+
+    // 输出响应并终止脚本
+    echo $response;
+    exit; // 确保立即返回并终止脚本
+}
+function newuserReply($user_id, $to_user) {
+	global $line_image_url_base;
+	global $store_url;
+    // 构建消息内容，包含用户查看生成作品的链接
+	$message_text = "$wechat_user_name 欢迎您使用 AI Magic，已经为您注册成功！\n\n";
+	$message_text .= "您可免费使用10次服务。\n\n";
+	$message_text .= "完成注册后，需要您再次上传您想要生成的原图片，即可由 AI Magic 生成精彩作品。\n\n";
+	$message_text .= "每次作品生成需等待 5-10 分钟，期间您可以到网站欣赏其他作品。\n\n";
+	$message_text .= "频道专属网站: $store_url\n\n";
+        $message_text .= "在某些情况下，AI可能无法识别您的图片，您可以再试一次，或更换图片试试!\n\n";
+	$message_text .= "请再次上传图片，并持续关心本频道，有任何意见，欢迎留言 - AI Magic 艺术推广中心";
+
+    // 构建微信回复的 XML 消息
+    $response = "<xml>
+                    <ToUserName><![CDATA[$user_id]]></ToUserName>
+                    <FromUserName><![CDATA[$to_user]]></FromUserName>
+                    <CreateTime>" . time() . "</CreateTime>
+                    <MsgType><![CDATA[text]]></MsgType>
+                    <Content><![CDATA[$message_text]]></Content>
+                 </xml>";
+
+    // 输出响应并终止脚本
+    echo $response;
+    //exit; // 确保立即返回并终止脚本
+}
+?>
+
+
+目錄：/hermes/bosnacweb08/bosnacweb08ar/b174/ipg.sweetekconnie46425/line/lineapi/php
+檔名：wechatwebhook_bk20250124.php
+==================================================
+<?php
+// wechat_webhook.php
+
+// 簡單測試版本的 WeChat Webhook
+
+// 校驗微信伺服器的請求
+$token = "WxEqualsecureToken2024";
+$signature = $_GET["signature"] ?? '';
+$timestamp = $_GET["timestamp"] ?? '';
+$nonce = $_GET["nonce"] ?? '';
+$echostr = $_GET["echostr"] ?? '';
+
+$tmpArr = [$token, $timestamp, $nonce];
+sort($tmpArr, SORT_STRING);
+$tmpStr = implode($tmpArr);
+$tmpStr = sha1($tmpStr);
+
+if ($tmpStr == $signature && !empty($echostr)) {
+    echo $echostr;
+    exit;
+}
+
+// 取得 POST 請求內容
+$input = file_get_contents('php://input');
+logme("Received input: " . $input);
+
+// 將 XML 內容解析為對象
+libxml_disable_entity_loader(true); // 安全考量，避免 XML 注入
+$data = simplexml_load_string($input, 'SimpleXMLElement', LIBXML_NOCDATA);
+
+if ($data === false) {
+    logme("Failed to parse XML input");
+    exit;
+}
+
+// 獲取消息類型和用戶信息
+$msgType = strtolower($data->MsgType);
+$user_id = $data->FromUserName;
+$to_user = $data->ToUserName;
+
+logme("Processing event for user: $user_id");
+
+$messages = [];
+
+switch ($msgType) {
+    case "text":
+        $content = trim($data->Content);
+        $reply_content = "您發送的消息是：" . $content;
+        $messages[] = generateTextReply($user_id, $to_user, $reply_content);
+        break;
+
+    case "image":
+        $image_url = trim($data->PicUrl);
+        $reply_content = "您發送的圖片 URL 是：" . $image_url;
+        $messages[] = generateTextReply($user_id, $to_user, $reply_content);
+        break;
+
+    default:
+        $messages[] = generateTextReply($user_id, $to_user, "抱歉，目前僅支持文本和圖片消息。");
+        break;
+}
+
+// 最後回復用戶
+if (!empty($messages)) {
+    foreach ($messages as $message) {
+        echo $message;
+    }
+}
+
+// 生成文本回复
+function generateTextReply($to_user, $from_user, $content) {
+    return "<xml>
+                <ToUserName><![CDATA[$to_user]]></ToUserName>
+                <FromUserName><![CDATA[$from_user]]></FromUserName>
+                <CreateTime>" . time() . "</CreateTime>
+                <MsgType><![CDATA[text]]></MsgType>
+                <Content><![CDATA[$content]]></Content>
+            </xml>";
+}
+
+function logme($message) {
+    // 定義日誌檔的路徑
+    $log_file = 'wechat_webhook.log';
+
+    // 格式化消息，添加時間戳
+    $formatted_message = "[" . date("Y-m-d H:i:s") . "] " . $message . "\n";
+
+    // 確保使用 UTF-8 編碼寫入檔
+    file_put_contents($log_file, $formatted_message, FILE_APPEND | LOCK_EX);
+}
+?>
+
